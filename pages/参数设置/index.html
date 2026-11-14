@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>看视频参数</title>
+<style>
+  :root {
+    --bg: #0b0f17;
+    --card: #131a26;
+    --card2: #182233;
+    --line: #243247;
+    --text: #e6edf7;
+    --dim: #8ea0b8;
+    --accent: #3ea6ff;
+    --ok: #34d399;
+    --err: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 18px;
+    font: 14px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: var(--bg); color: var(--text);
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: var(--dim); font-size: 12px; margin-bottom: 16px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 14px; padding: 16px; margin-bottom: 14px;
+  }
+  .card h2 { font-size: 13px; color: var(--dim); font-weight: 600; margin: 0 0 12px; letter-spacing: .04em; }
+  .row {
+    display: grid; grid-template-columns: 1fr 150px; gap: 12px; align-items: center;
+    padding: 8px 0; border-bottom: 1px dashed rgba(255,255,255,.05);
+  }
+  .row:last-child { border-bottom: 0; }
+  .label b { display: block; font-weight: 600; }
+  .label span { color: var(--dim); font-size: 12px; }
+  input[type="number"], input[type="text"], select {
+    width: 100%; background: var(--card2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 9px; padding: 8px 10px;
+    font-size: 14px; outline: none;
+  }
+  input:focus, select:focus { border-color: var(--accent); }
+  .toggle {
+    position: relative; width: 46px; height: 26px; border-radius: 99px;
+    background: #2a3a52; cursor: pointer; transition: .18s; justify-self: end;
+  }
+  .toggle.on { background: var(--accent); }
+  .toggle::after {
+    content: ""; position: absolute; top: 3px; left: 3px; width: 20px; height: 20px;
+    border-radius: 50%; background: #fff; transition: .18s;
+  }
+  .toggle.on::after { left: 23px; }
+  .actions { display: flex; gap: 10px; align-items: center; }
+  button {
+    border: 0; border-radius: 10px; padding: 10px 18px; font-size: 14px;
+    cursor: pointer; background: var(--accent); color: #06121f; font-weight: 700;
+  }
+  button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--line); }
+  #msg { font-size: 13px; }
+  #msg.ok { color: var(--ok); }
+  #msg.err { color: var(--err); }
+  .hint { color: var(--dim); font-size: 12px; margin-top: 10px; }
+</style>
+</head>
+<body>
+  <h1>分段看视频 · 参数</h1>
+  <div class="sub">改完点保存即可，不用重启；正在跑的这一次会用旧参数收尾，下一次生效。</div>
+
+  <div class="card">
+    <h2>分段与抽帧</h2>
+    <div class="row">
+      <div class="label"><b>每段时长（秒）</b><span>默认 300；改成 180 就是 3 分钟一段</span></div>
+      <input id="segment_seconds" type="number" min="30" max="3600" step="10" />
+    </div>
+    <div class="row">
+      <div class="label"><b>每段格数</b><span>默认 9；16 格更密，图更大更贵</span></div>
+      <input id="frames_per_segment" type="number" min="2" max="30" step="1" />
+    </div>
+    <div class="row">
+      <div class="label"><b>切镜灵敏度</b><span>0.2 更碎，0.5 更粗；默认 0.3</span></div>
+      <input id="scene_threshold" type="number" min="0.1" max="0.9" step="0.05" />
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>特写</h2>
+    <div class="row">
+      <div class="label"><b>自动挑一格细看</b><span>每段里挑切点最多的一格，再拆成小格子</span></div>
+      <div class="toggle" id="auto_zoom"></div>
+    </div>
+    <div class="row">
+      <div class="label"><b>允许 /kv zoom 手动展开</b><span>关掉后手动命令也停用</span></div>
+      <div class="toggle" id="zoom_enable"></div>
+    </div>
+    <div class="row">
+      <div class="label"><b>特写格数</b><span>默认 9，范围为几十秒</span></div>
+      <input id="zoom_frames" type="number" min="2" max="16" step="1" />
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>听声音与推送</h2>
+    <div class="row">
+      <div class="label"><b>语音转写</b><span>关掉就只看画面、没有说话内容</span></div>
+      <div class="toggle" id="asr_enable"></div>
+    </div>
+    <div class="row">
+      <div class="label"><b>转写语种</b><span>auto 自动识别，日语锁 ja 更稳</span></div>
+      <select id="asr_language">
+        <option value="auto">自动</option>
+        <option value="zh">中文</option>
+        <option value="ja">日语</option>
+        <option value="en">英语</option>
+        <option value="ko">韩语</option>
+        <option value="yue">粤语</option>
+      </select>
+    </div>
+    <div class="row">
+      <div class="label"><b>逐段推送进度</b><span>每段看完就发图 + 摘要</span></div>
+      <div class="toggle" id="push_progress"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>目录</h2>
+    <div class="row">
+      <div class="label"><b>视频文件夹</b><span>大文件丢这里，然后 /kv 文件名</span></div>
+      <input id="watch_dir" type="text" placeholder="留空则用插件 data/inbox" />
+    </div>
+    <div class="row">
+      <div class="label"><b>单次最多段数</b><span>0 表示不限</span></div>
+      <input id="max_segments_per_run" type="number" min="0" max="999" step="1" />
+    </div>
+    <div class="hint">命令：<code>/kv 文件名</code>、<code>/kv zoom 段 格</code>、<code>/kv status</code>、<code>/kv stop</code></div>
+  </div>
+
+  <div class="actions">
+    <button id="save">保存</button>
+    <button class="ghost" id="reload">重新读取</button>
+    <span id="msg"></span>
+  </div>
+
+<script>
+  const BOOLS = ["zoom_enable", "auto_zoom", "asr_enable", "push_progress"];
+  const msg = document.getElementById("msg");
+
+  function setMsg(text, ok) {
+    msg.textContent = text || "";
+    msg.className = ok === true ? "ok" : ok === false ? "err" : "";
+  }
+
+  async function bridge() {
+    for (let i = 0; i < 60; i++) {
+      const api = window.AstrBotPluginView || window.AstrBotPluginPage;
+      if (api && typeof api.apiGet === "function") return api;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    throw new Error("页面桥未就绪，请刷新面板重试");
+  }
+
+  function paintToggle(el, on) {
+    el.classList.toggle("on", !!on);
+    el.dataset.on = on ? "1" : "0";
+  }
+
+  function render(cfg) {
+    for (const key of BOOLS) {
+      paintToggle(document.getElementById(key), cfg[key]);
+    }
+    for (const key of ["segment_seconds","frames_per_segment","scene_threshold","zoom_frames","max_segments_per_run","watch_dir","asr_language"]) {
+      const el = document.getElementById(key);
+      if (el) el.value = cfg[key] ?? "";
+    }
+  }
+
+  async function load() {
+    setMsg("读取中…");
+    try {
+      const api = await bridge();
+      const data = await api.apiGet("page/config");
+      const cfg = (data && data.config) || {};
+      render(cfg);
+      setMsg("已读取", true);
+    } catch (err) {
+      setMsg("读取失败: " + (err && err.message || err), false);
+    }
+  }
+
+  async function save() {
+    const payload = {};
+    for (const key of BOOLS) {
+      payload[key] = document.getElementById(key).dataset.on === "1";
+    }
+    for (const key of ["segment_seconds","frames_per_segment","scene_threshold","zoom_frames","max_segments_per_run"]) {
+      payload[key] = Number(document.getElementById(key).value || 0);
+    }
+    payload.watch_dir = document.getElementById("watch_dir").value.trim();
+    payload.asr_language = document.getElementById("asr_language").value;
+    setMsg("保存中…");
+    try {
+      const api = await bridge();
+      const query = {};
+      for (const [k, v] of Object.entries(payload)) query[k] = String(v);
+      const data = await api.apiGet("page/config/set", query);
+      if (data && data.ok) {
+        render(data.config || payload);
+        setMsg("已保存，下一段起生效", true);
+      } else {
+        setMsg("保存失败", false);
+      }
+    } catch (err) {
+      setMsg("保存失败: " + (err && err.message || err), false);
+    }
+  }
+
+  for (const key of BOOLS) {
+    const el = document.getElementById(key);
+    el.addEventListener("click", () => paintToggle(el, el.dataset.on !== "1"));
+  }
+  document.getElementById("save").addEventListener("click", save);
+  document.getElementById("reload").addEventListener("click", load);
+  load();
+</script>
+</body>
+</html>

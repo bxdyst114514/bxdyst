@@ -1,0 +1,30 @@
+name: astrbot_plugin_video_storyboard
+display_name: 分段看视频
+short_desc: 让机器人一段一段看完你的视频：分镜抽帧、语音转写、逐段点评。
+desc: |
+  让机器人“按段看完”一个本地视频：每一段做分镜抽帧、拼成九宫格，配上这一段的语音转写，
+  再交给支持图片的对话模型写一段观后感，逐段推送，最后给整片总结。
+
+  特点：
+  - 不限时长，按窗口滚动处理，可断点续看；
+  - 支持 `/kv zoom 段 格` 对任意一格做二级特写；
+  - 视频可以放进指定文件夹用 `/kv 文件名` 打开，也可以直接在 QQ 里发给机器人；
+  - 语音转写用 SenseVoice（可选，未配置时只看画面）；
+  - 参数可在插件页面的「参数设置」里热改，下一段生效。
+version: 0.3.0
+author: xiaoman
+repo: https://github.com/bxdyst114514/bxdyst
+astrbot_version: ">=4.22.0"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - qq_official_webhook
+social_link: https://github.com/bxdyst114514
+tags:
+  - 视频
+  - 多模态
+  - 语音转写
+  - 陪伴
+pages:
+  - name: 参数设置
+    title: 看视频参数

@@ -1,0 +1,91 @@
+{
+  "watch_dir": {
+    "description": "视频文件夹",
+    "type": "string",
+    "default": "",
+    "hint": "把视频丢进这个文件夹，然后用 /kv 文件名 让机器人看。QQ 直接发视频也支持。"
+  },
+  "segment_seconds": {
+    "description": "每段时长（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "每段抽帧+转写一次。300 秒一段比较均衡；短视频可设 120。"
+  },
+  "frames_per_segment": {
+    "description": "每段最多抽几帧",
+    "type": "int",
+    "default": 9,
+    "hint": "按镜头切点分配，最多拼成这么多格。9 格刚好一张九宫格。"
+  },
+  "scene_threshold": {
+    "description": "分镜灵敏度",
+    "type": "float",
+    "default": 0.3,
+    "hint": "0.2 更敏感（切点多），0.4 更保守。"
+  },
+  "ffmpeg_path": {
+    "description": "ffmpeg 路径（可留空）",
+    "type": "string",
+    "default": "",
+    "hint": "留空自动在 PATH 里找。"
+  },
+  "ffprobe_path": {
+    "description": "ffprobe 路径（可留空）",
+    "type": "string",
+    "default": "",
+    "hint": "留空自动在 PATH 里找。"
+  },
+  "asr_enable": {
+    "description": "转写台词",
+    "type": "bool",
+    "default": true
+  },
+  "asr_model_dir": {
+    "description": "SenseVoice 模型目录",
+    "type": "string",
+    "default": "",
+    "hint": "留空使用插件 data/models/sensevoice，首次运行会自动下载（约 240MB）。"
+  },
+  "asr_auto_download": {
+    "description": "自动下载语音模型",
+    "type": "bool",
+    "default": true,
+    "hint": "本地没有模型时自动下载到插件目录。"
+  },
+  "asr_language": {
+    "description": "转写语言",
+    "type": "string",
+    "default": "auto",
+    "hint": "auto / zh / en / ja / ko / yue"
+  },
+  "push_progress": {
+    "description": "逐段播报",
+    "type": "bool",
+    "default": true,
+    "hint": "每看完一段就发一条消息。"
+  },
+  "max_segments_per_run": {
+    "description": "单次最多看几段",
+    "type": "int",
+    "default": 0,
+    "hint": "0 表示全部看完。"
+  },
+  "zoom_enable": {
+    "description": "开启二级特写",
+    "type": "bool",
+    "default": true,
+    "hint": "允许把某一段里的某一格再切成 9 小格细看。"
+  },
+  "auto_zoom": {
+    "description": "自动展开最精彩的一格",
+    "type": "bool",
+    "default": true,
+    "hint": "每段结束后自动挑切镜最多的一格做特写；关掉后只能用 /kv zoom 手动展开。"
+  },
+  "zoom_frames": {
+    "description": "特写抽几帧",
+    "type": "int",
+    "default": 9,
+    "hint": "一格再分多少小格，9 刚好一张九宫格。"
+  }
+}
