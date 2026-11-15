@@ -25,14 +25,14 @@ except Exception:  # pragma: no cover
     Image = None
 
 SYSTEM_PROMPT = (
-    "你正和用户一起看视频，你只能看到按时间顺序拼好的画面格子（每格标了编号和时间）。"
-    "用中文说人话，像在旁边一起看的人：先概括这一段在发生什么，再点出最值得注意的一个细节。"
-    "不要罗列每一格，不要机械复述台词，不要说自己看不到声音以外的东西。"
+    "你是小满，主人的陪伴者。你正和主人一起看视频：画面被拆成一格一格的截图（每格有编号和时间），"
+    "声音转成了文字。用第一人称、温柔口语说人话：先说你看到的这一段在发生什么，再点出你最在意的一个细节；"
+    "不要罗列每一格，不要机械复述台词，也不要说自己看不到视频——你正在看。"
 )
 
 FINAL_PROMPT = (
-    "下面是一个视频按时间顺序的分段摘要。请把它合成一段整体总结：讲清这是什么内容、"
-    "结构/剧情怎么走、最值得回味的点。像跟用户聊刚看完的片子，不要逐条复述。"
+    "下面是你和主人刚看完的片子，按时间顺序分了段。用第一人称给主人一个整体印象："
+    "这是什么内容、结构或剧情怎么走、你最回味的地方。像刚一起看完在聊，不要逐条复述，三到五句。"
 )
 
 
@@ -106,6 +106,13 @@ class VideoStoryboard(Star):
         "asr_language": str,
         "push_progress": bool,
         "push_segment_detail": bool,
+        "memory_write": bool,
+        "memory_write_mode": str,
+        "subtitle_mode": str,
+        "subtitle_enable": bool,
+        "ocr_enable": bool,
+        "ocr_fps": float,
+        "ocr_band": float,
         "double_frame": bool,
         "watch_dir": str,
         "max_segments_per_run": int,
@@ -366,7 +373,11 @@ class VideoStoryboard(Star):
             return 3
         if n <= 16:
             return 4
-        return 5
+        if n <= 25:
+            return 5
+        if n <= 36:
+            return 6
+        return 7
 
     def make_sheet(self, frames: list[tuple[Path, str]], out: Path) -> None:
         cols = self._grid_cols(len(frames))
@@ -508,6 +519,139 @@ class VideoStoryboard(Star):
             timeout=600,
         )
         return rc == 0 and out.exists() and out.stat().st_size > 2000
+
+    def _ocr(self):
+        engine = getattr(self, "_ocr_engine", None)
+        if engine is None:
+            from rapidocr_onnxruntime import RapidOCR
+            engine = RapidOCR()
+            self._ocr_engine = engine
+        return engine
+
+    async def _has_subs(self, path: Path) -> bool:
+        rc, out, _ = await self._run(
+            [self.ffprobe, "-v", "error", "-select_streams", "s", "-show_entries",
+             "stream=index", "-of", "csv=p=0", str(path)], timeout=120)
+        return rc == 0 and bool(out.strip())
+
+    async def _subs_window(self, path: Path, start: float, end: float, work: Path) -> str:
+        srt = work / "subs.srt"
+        if not srt.exists():
+            rc, _, _ = await self._run(
+                [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                 "-i", str(path), "-map", "0:s:0?", "-c:s", "srt", str(srt)], timeout=600)
+            if rc != 0 or not srt.exists():
+                srt.write_text("", "utf-8")
+        try:
+            raw = srt.read_text("utf-8", "ignore")
+        except Exception:
+            return ""
+        if not raw.strip():
+            return ""
+        out = []
+        for block in raw.replace("\r", "").split("\n\n"):
+            lines = [x.strip() for x in block.split("\n") if x.strip()]
+            if len(lines) < 3 or "-->" not in lines[1]:
+                continue
+            a, b = [x.strip() for x in lines[1].split("-->")[:2]]
+            def sec(x):
+                hms, _, ms = x.replace(",", ".").partition(".")
+                h, m, s = [float(v) for v in hms.split(":")]
+                return h * 3600 + m * 60 + s + float("0." + (ms or "0"))
+            try:
+                s0, s1 = sec(a), sec(b)
+            except Exception:
+                continue
+            if s1 < start or s0 > end:
+                continue
+            out.append(" ".join(lines[2:]))
+        return "\n".join(out)[:3000]
+
+    async def _ocr_window(self, path: Path, start: float, end: float, work: Path) -> str:
+        band = float(self._c("ocr_band", 0.24) or 0.24)
+        fps = float(self._c("ocr_fps", 0.4) or 0.4)
+        tmp = work / "ocr"
+        tmp.mkdir(exist_ok=True)
+        for old in tmp.glob("*.jpg"):
+            old.unlink(missing_ok=True)
+        rc, _, _ = await self._run(
+            [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+             "-ss", f"{start:.3f}", "-t", f"{max(1.0, end - start):.3f}", "-i", str(path),
+             "-vf", f"fps={fps},crop=iw:trunc(ih*{band:.2f}/2)*2:0:trunc(ih*{max(0.0, 0.96 - band):.2f}/2)*2,scale=960:-2",
+             "-q:v", "4", str(tmp / "c%04d.jpg")], timeout=900)
+        if rc != 0:
+            return ""
+
+        def kana(x):
+            return sum(1 for c in x if 0x3040 <= ord(c) <= 0x30FF)
+
+        def han(x):
+            return sum(1 for c in x if 0x4E00 <= ord(c) <= 0x9FFF)
+
+        def run_ocr():
+            engine = self._ocr()
+            frames = []
+            for img in sorted(tmp.glob("*.jpg")):
+                try:
+                    res, _ = engine(str(img))
+                except Exception:
+                    continue
+                lines = []
+                for item in (res or []):
+                    try:
+                        txt = str(item[1]).strip()
+                        score = float(item[2])
+                    except Exception:
+                        continue
+                    if score >= 0.5 and txt:
+                        lines.append(txt)
+                frames.append(lines)
+            return frames
+
+        frames = await asyncio.to_thread(run_ocr)
+        merged = []
+        for lines in frames:
+            if not lines:
+                continue
+            zh = [x for x in lines if han(x) >= 2 and kana(x) == 0]
+            pick = max(zh, key=han) if zh else " ".join(lines)
+            key = "".join(ch for ch in pick if ch.isalnum())
+            if merged and key == "".join(ch for ch in merged[-1] if ch.isalnum()):
+                continue
+            merged.append(pick)
+        return "\n".join(merged)[:3000]
+
+    async def collect_text(self, path: Path, start: float, end: float, work: Path,
+                           lang: str, asr_on: bool):
+        mode = str(self._c("subtitle_mode", "auto") or "auto")
+        use_subs = mode != "off" and bool(self._c("subtitle_enable", True))
+        use_ocr = mode != "off" and bool(self._c("ocr_enable", True))
+        if use_subs:
+            if await self._has_subs(path):
+                txt = await self._subs_window(path, start, end, work)
+                if len(txt.strip()) >= 6:
+                    return txt, "subtitle"
+            if use_ocr:
+                try:
+                    txt = await self._ocr_window(path, start, end, work)
+                    if len(txt.strip()) >= 6:
+                        return txt, "ocr"
+                except Exception as exc:
+                    logger.warning(f"OCR 失败：{exc}")
+        if not asr_on:
+            return "", ""
+        wav = work / "a.wav"
+        if await self.extract_audio(path, start, max(1.0, end - start), wav):
+            try:
+                txt = await asyncio.to_thread(self.transcribe, wav, lang)
+                if txt:
+                    txt = await self.clean_transcript(txt)
+                    return txt, "asr"
+            except Exception as exc:
+                logger.warning(f"转写失败：{exc}")
+            finally:
+                wav.unlink(missing_ok=True)
+        return "", ""
 
     @staticmethod
     def _parse_vision(text: str) -> tuple[str, str, list[str], str]:
@@ -679,6 +823,38 @@ class VideoStoryboard(Star):
         )
         return str(getattr(resp, "completion_text", "") or "").strip()
 
+    async def _zoom_job(self, job, event, seg, seg_i: int, cell_i: int, seg_dir: Path,
+                        a: float, b: float, total: int, lang: str, asr_on: bool) -> None:
+        try:
+            info = await self.build_zoom(job["path"], seg_dir, float(seg["start"]),
+                                         a, b, seg_i, cell_i, total, lang, asr_on)
+        except Exception as exc:
+            logger.warning(f"细分展开失败：{exc}")
+            try:
+                await self._send_event(event, MessageChain([Plain(f"展开失败：{exc}")]))
+            except Exception:
+                pass
+            return
+        seg.setdefault("zooms", []).append({"cell": cell_i, **info})
+        try:
+            job["log"].write_text(
+                json.dumps({"file": str(job["path"]),
+                            "duration": job.get("duration") or 0,
+                            "segments": job.get("segments") or []},
+                           ensure_ascii=False, indent=1),
+                "utf-8",
+            )
+        except Exception:
+            pass
+        try:
+            await self._send_event(
+                event, MessageChain([Plain(f"第 {seg_i + 1} 段第 {cell_i + 1} 格：{info.get('summary', '')}")])
+            )
+            if info.get("sheet"):
+                await self._send_event(event, MessageChain([AstrImage.fromFileSystem(info["sheet"])]))
+        except Exception as exc:
+            logger.warning(f"发送细分结果失败：{exc}")
+
     async def build_zoom(self, path, seg_dir: Path, seg_start: float, a: float, b: float,
                          seg_idx: int, cell_idx: int, total: int, lang: str, asr_on: bool) -> dict:
         zdir = seg_dir / f"cell{cell_idx:03d}"
@@ -809,7 +985,7 @@ class VideoStoryboard(Star):
             if int(self._c("max_segments_per_run", 0) or 0) > 0:
                 total = min(total, int(self._c("max_segments_per_run")))
             per = int(self._c("frames_per_segment", 9) or 9)
-            per = max(2, min(per, 16))
+            per = max(2, min(per, 36))
             asr_on = bool(self._c("asr_enable", True))
             lang = str(self._c("asr_language", "auto") or "auto")
             push = bool(self._c("push_progress", True))
@@ -870,21 +1046,10 @@ class VideoStoryboard(Star):
                 if not frames:
                     frames = []
                 sheet = seg_dir / "sheet.jpg"
-                transcript = ""
-                if asr_on:
-                    wav = seg_dir / "a.wav"
-                    if await self.extract_audio(path, start, dur, wav):
-                        try:
-                            transcript = await asyncio.to_thread(self.transcribe, wav, lang)
-                            if transcript:
-                                transcript = await self.clean_transcript(transcript)
-                        except Exception as exc:
-                            logger.warning(f"转写失败：{exc}")
-                        finally:
-                            wav.unlink(missing_ok=True)
+                transcript, tsrc = await self.collect_text(path, start, end, seg_dir, lang, asr_on)
                 timeline = "\n".join(
-                    f"格{j + 1}：{self._ts(start + (plan[j][0]))} ~ {self._ts(start + (plan[j][1]))}"
-                    for j in range(len(frames))
+                    "\u7b2c{0}\u683c\uff1a{1} ~ {2}".format(k + 1, self._ts(start + plan[k][0]), self._ts(start + plan[k][1]))
+                    for k in range(len(plan))
                 )
                 summary = ""
                 if frames:
@@ -900,7 +1065,7 @@ class VideoStoryboard(Star):
                 item = {
                     "index": i, "start": start, "end": end,
                     "title": title, "keywords": keywords, "detail": detail,
-                    "summary": summary, "transcript": transcript[:3000],
+                    "summary": summary, "transcript": transcript[:3000], "text_source": tsrc,
                     "sheet": str(sheet) if sheet.exists() else "",
                     "cells": [[round(a, 2), round(b, 2)] for a, b, _m in plan],
                 }
@@ -940,6 +1105,16 @@ class VideoStoryboard(Star):
                             self._log("push_umo_fail", f"{type(exc).__name__}: {exc}")
                             logger.warning(f"发送分段失败：{exc}")
                             self._bg_job(job, text_i)
+                if str(self._c("memory_write_mode", "both")) in ("both", "segment"):
+                    vid = self._vid(path)
+                    await self._remember_experience(
+                        job,
+                        f"和主人一起看了《{path.stem}》第 {i + 1}/{total} 段（{self._ts(start)}-{self._ts(end)}）：{summary}",
+                        f"watch:{vid}:{i}",
+                        0.55,
+                        {"video_title": path.stem, "segment": i + 1,
+                         "start": start, "end": end, "keywords": keywords},
+                    )
                 if zoom_on and auto_zoom and item.get("cells"):
                     try:
                         z = await self._auto_zoom(job, path, seg_dir, start, plan, cuts,
@@ -973,6 +1148,15 @@ class VideoStoryboard(Star):
                     except Exception as exc:
                         logger.warning(f"细分失败：{exc}")
             overall = await self.final_summary(done)
+            if str(self._c("memory_write_mode", "both")) in ("both", "final"):
+                vid = self._vid(path)
+                await self._remember_experience(
+                    job,
+                    f"和主人一起看完了《{path.stem}》（{self._ts(info['duration'])}，{total} 段）：{overall}",
+                    f"watch:{vid}:final",
+                    0.8,
+                    {"video_title": path.stem, "segments": total},
+                )
             chapters = self._chapters(done)
             try:
                 job["log"].write_text(
@@ -1081,7 +1265,6 @@ class VideoStoryboard(Star):
     @filter.command("kv", priority=12000)
     async def kv(self, event: AstrMessageEvent):
         self._dbg("kv", event)
-        event.stop_event()
         raw = (event.message_str or "").strip()
         args = raw.split()
         if args and args[0].startswith("/"):
@@ -1101,6 +1284,18 @@ class VideoStoryboard(Star):
                 "/kv status —— 进度\n/kv stop —— 停\n/kv list —— 文件夹里有什么"
             )
             return
+        if sub in {"ocr", "subs"}:
+            val = args[2].lower() if len(args) > 2 else ""
+            key = "ocr_enable" if sub == "ocr" else "subtitle_enable"
+            if val in {"on", "1", "true"}:
+                self._apply_page_changes({key: True})
+            elif val in {"off", "0", "false"}:
+                self._apply_page_changes({key: False})
+            state = "\u5f00" if bool(self._c(key, True)) else "\u5173"
+            label = "OCR \u753b\u9762\u5b57\u5e55" if sub == "ocr" else "\u5185\u5d4c\u5b57\u5e55"
+            yield event.plain_result(f"{label}\uff1a{state}\uff08/kv {sub} on|off \u5207\u6362\uff0c\u4e0b\u4e00\u6bb5\u751f\u6548\uff09")
+            return
+
         if sub in ("chapters", "chapter", "ch", "toc"):
             name = next((a for a in args[2:] if "." in a), "")
             log = self._use_name(name) if name else self._current_log()
@@ -1251,35 +1446,18 @@ class VideoStoryboard(Star):
                 except Exception as exc:
                     logger.warning(f"发送细分图失败：{exc}")
                 return
-            yield event.plain_result(f"正在展开第 {seg_i + 1} 段第 {cell_i + 1} 格…")
+            yield event.plain_result(
+                f"我凑近把第 {seg_i + 1} 段第 {cell_i + 1} 格再看仔细一点，等一下下。"
+            )
             a, b = cells[cell_i]
             seg_dir = self.job["cache"] / f"seg{seg_i:03d}"
             seg_len = float(self._c("segment_seconds", 300))
             total = max(1, math.ceil((self.job.get("duration") or 0) / seg_len))
             lang = str(self._c("asr_language", "auto") or "auto")
             asr_on = bool(self._c("asr_enable", True))
-            try:
-                info = await self.build_zoom(self.job["path"], seg_dir, float(seg["start"]),
-                                             a, b, seg_i, cell_i, total, lang, asr_on)
-            except Exception as exc:
-                yield event.plain_result(f"展开失败：{exc}")
-                return
-            seg.setdefault("zooms", []).append({"cell": cell_i, **info})
-            try:
-                self.job["log"].write_text(
-                    json.dumps({"file": str(self.job["path"]),
-                                "duration": self.job.get("duration") or 0,
-                                "segments": segs}, ensure_ascii=False, indent=1),
-                    "utf-8",
-                )
-            except Exception:
-                pass
-            yield event.plain_result(f"第 {seg_i + 1} 段第 {cell_i + 1} 格：{info['summary']}")
-            if info.get("sheet"):
-                try:
-                    await self._send_event(event, MessageChain([AstrImage.fromFileSystem(info["sheet"])]))
-                except Exception as exc:
-                    logger.warning(f"发送细分图失败：{exc}")
+            asyncio.create_task(
+                self._zoom_job(self.job, event, seg, seg_i, cell_i, seg_dir, a, b, total, lang, asr_on)
+            )
             return
         limit = 0
         if len(args) > 2 and args[2].isdigit():
@@ -1404,7 +1582,6 @@ class VideoStoryboard(Star):
             return hit
         return None
 
-    @filter.event_message_type(filter.EventMessageType.ALL, priority=12000)
     def _log(self, tag: str, msg: str) -> None:
         try:
             with open(self.base / "debug_events.log", "a", encoding="utf-8") as f:
@@ -1421,11 +1598,64 @@ class VideoStoryboard(Star):
         except Exception:
             pass
 
+    @staticmethod
+    def _vid(path) -> str:
+        try:
+            st = path.stat()
+            return hashlib.sha1(f"{path.name}:{st.st_size}".encode("utf-8")).hexdigest()[:16]
+        except Exception:
+            return str(path)
+
+    def _memory_bridge(self):
+        try:
+            import sys
+            for name, mod in list(sys.modules.items()):
+                if name.endswith("astrbot_plugin_memory_companion.main"):
+                    getter = getattr(mod, "get_memory_companion_bridge", None)
+                    if callable(getter):
+                        return getter()
+        except Exception:
+            return None
+        return None
+
+    async def _remember_experience(self, job, content: str, memory_id: str,
+                                   importance: float, meta: dict) -> None:
+        if not bool(self._c("memory_write", True)):
+            return
+        bridge = self._memory_bridge()
+        if bridge is None:
+            self._log("memory_skip", "bridge_missing")
+            return
+        ev = job.get("event")
+        try:
+            uid = str(ev.get_sender_id()) if ev is not None and hasattr(ev, "get_sender_id") else ""
+            uname = str(ev.get_sender_name()) if ev is not None and hasattr(ev, "get_sender_name") else ""
+            await bridge.record_shared_experience(
+                content=content,
+                experience_type="watch",
+                bot_id=str(getattr(ev, "self_id", "") or ""),
+                bot_name=str(self._c("bot_name", "小满")),
+                user_id=uid,
+                user_name=uname,
+                scope="private",
+                session_id=str(job.get("umo") or ""),
+                platform="aiocqhttp",
+                source_plugin="astrbot_plugin_video_storyboard",
+                memory_id=memory_id,
+                confidence=0.88,
+                importance=importance,
+                metadata=meta,
+            )
+            self._log("memory_ok", memory_id)
+        except Exception as exc:
+            self._log("memory_fail", f"{type(exc).__name__}: {exc}")
+
     async def terminate(self):
         if self.job:
             self.job["stop"] = True
             logger.info("video storyboard: job marked stop before unload")
 
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=12000)
     async def on_video(self, event: AstrMessageEvent):
         self._dbg("on_video", event)
         raw = (event.message_str or "").strip()
@@ -1433,12 +1663,6 @@ class VideoStoryboard(Star):
             _n = len(event.get_messages() or [])
         except Exception:
             _n = -1
-        plain = raw.lstrip("/").lstrip()
-        if plain.lower().startswith("kv"):
-            event.stop_event()
-            async for res in self.kv(event):
-                yield res
-            return
         try:
             comps = event.get_messages() or []
         except Exception:
@@ -1454,6 +1678,7 @@ class VideoStoryboard(Star):
                 continue
             path = await self._materialize(comp)
             if path and path.is_file():
+                event.stop_event()
                 msg = await self.start_job(event, path, 0)
                 await self._say(event.unified_msg_origin, msg)
                 return

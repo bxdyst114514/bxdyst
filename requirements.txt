@@ -1,3 +1,4 @@
 # 运行插件所需依赖（AstrBot 本体已自带 pillow/numpy/quart，不重复声明）
 funasr-onnx>=0.4.1
 onnxruntime>=1.16.0
+rapidocr-onnxruntime>=1.4.4
