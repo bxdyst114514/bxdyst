@@ -87,5 +87,17 @@
     "type": "int",
     "default": 9,
     "hint": "一格再分多少小格，9 刚好一张九宫格。"
+  },
+  "push_segment_detail": {
+    "description": "每段截图加感想",
+    "type": "bool",
+    "default": true,
+    "hint": "打开：每看完一段发一张九宫格 + 一段感想；关闭：只在全部看完后发整体印象。"
+  },
+  "double_frame": {
+    "description": "快剪双联帧",
+    "type": "bool",
+    "default": true,
+    "hint": "切点很密的片段（平均镜头 < 2 秒），每格改用前后两帧左右拼图，更容易看清动作。"
   }
 }

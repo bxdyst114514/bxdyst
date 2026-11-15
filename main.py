@@ -105,6 +105,8 @@ class VideoStoryboard(Star):
         "asr_enable": bool,
         "asr_language": str,
         "push_progress": bool,
+        "push_segment_detail": bool,
+        "double_frame": bool,
         "watch_dir": str,
         "max_segments_per_run": int,
     }
@@ -201,7 +203,7 @@ class VideoStoryboard(Star):
 
     def _watch_dir(self) -> Path:
         configured = str(self._c("watch_dir", "") or "").strip().strip('"')
-        path = Path(configured).expanduser() if configured else (self.base / "data" / "inbox")
+        path = Path(configured).expanduser() if configured else (self.base / "inbox")
         try:
             path.mkdir(parents=True, exist_ok=True)
         except Exception:
@@ -297,30 +299,28 @@ class VideoStoryboard(Star):
 
     @staticmethod
     def _plan_times(cuts: list[float], dur: float, limit: int) -> list[tuple[float, float, float]]:
-        """返回 (间隔起点, 间隔终点, 取帧时刻) 列表，按间隔长度合并到 limit 个。"""
-        bounds = [0.0] + sorted(cuts) + [dur]
-        intervals = [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
-        intervals = [(a, b) for a, b in intervals if b - a > 0.8]
-        if not intervals:
-            intervals = [(0.0, dur)]
-        while len(intervals) > limit:
-            idx = min(range(len(intervals)), key=lambda i: intervals[i][1] - intervals[i][0])
-            a, b = intervals.pop(idx)
-            if idx < len(intervals):
-                intervals[idx] = (a, intervals[idx][1])
-            elif idx > 0:
-                intervals[idx - 1] = (intervals[idx - 1][0], b)
+        """均匀窗口保证覆盖，窗内取最长镜头的中点（避开转场/模糊）。"""
+        n = max(1, int(limit))
+        win = dur / n
+        cs = sorted(t for t in cuts if 0.6 < t < dur - 0.6)
+        bounds = [0.0] + cs + [dur]
+        shots = [(bounds[i], bounds[i + 1]) for i in range(len(bounds) - 1)]
+        shots = [(a, b) for a, b in shots if b - a >= 0.4]
+        out = []
+        for i in range(n):
+            ws, we = i * win, min(dur, (i + 1) * win)
+            cand = []
+            for a, b in shots:
+                lo, hi = max(a, ws), min(b, we)
+                if hi - lo > 0.3:
+                    cand.append((hi - lo, lo, hi))
+            if cand:
+                _, lo, hi = max(cand)
+                mid = (lo + hi) / 2.0
             else:
-                break
-        # 镜头太少的视频按时间均分补齐，保证横向覆盖
-        while len(intervals) < limit:
-            idx = max(range(len(intervals)), key=lambda i: intervals[i][1] - intervals[i][0])
-            a, b = intervals[idx]
-            if b - a < 2.0:
-                break
-            mid = (a + b) / 2.0
-            intervals[idx:idx + 1] = [(a, mid), (mid, b)]
-        return [(a, b, (a + b) / 2.0) for a, b in intervals]
+                mid = (ws + we) / 2.0
+            out.append((ws, we, mid))
+        return out
 
     async def grab_frame(self, path: Path, at: float, out: Path) -> bool:
         rc, _, _ = await self._run(
@@ -333,9 +333,45 @@ class VideoStoryboard(Star):
         )
         return rc == 0 and out.exists() and out.stat().st_size > 0
 
+    @staticmethod
+    def _pair(left: Path, right: Path, out: Path) -> None:
+        """前后两帧左右拼成一张 16:9，铺满格子不留黑边。"""
+        try:
+            a = Image.open(left).convert("RGB")
+            b = Image.open(right).convert("RGB")
+            h, gap = 540, 6
+            half = (960 - gap) // 2
+            def cover(im):
+                r = max(half / im.width, h / im.height)
+                im = im.resize((max(half, int(im.width * r)), max(h, int(im.height * r))))
+                x = (im.width - half) // 2
+                y = (im.height - h) // 2
+                return im.crop((x, y, x + half, y + h))
+            canvas = Image.new("RGB", (half * 2 + gap, h), (14, 18, 26))
+            canvas.paste(cover(a), (0, 0))
+            canvas.paste(cover(b), (half + gap, 0))
+            canvas.save(out, "JPEG", quality=85)
+        except Exception:
+            try:
+                left.replace(out)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _grid_cols(n: int) -> int:
+        """按格数选列数：9→3、12→4、16→4，尽量方。"""
+        if n <= 4:
+            return 2
+        if n <= 9:
+            return 3
+        if n <= 16:
+            return 4
+        return 5
+
     def make_sheet(self, frames: list[tuple[Path, str]], out: Path) -> None:
-        cols = 3
-        cw, ch, bar = 500, 282, 26
+        cols = self._grid_cols(len(frames))
+        cw = min(500, int(1600 / cols))
+        ch, bar = int(cw * 0.564), 26
         rows = max(1, math.ceil(len(frames) / cols))
         sheet = Image.new("RGB", (cols * cw, rows * (ch + bar)), (14, 18, 26))
         draw = ImageDraw.Draw(sheet)
@@ -365,7 +401,7 @@ class VideoStoryboard(Star):
         configured = str(self._c("asr_model_dir", "") or "").strip().strip('"')
         if configured:
             return Path(configured).expanduser()
-        return self.base / "data" / "models" / "sensevoice"
+        return self.base / "models" / "sensevoice"
 
     def _download_file(self, url: str, dst: Path) -> None:
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -473,6 +509,114 @@ class VideoStoryboard(Star):
         )
         return rc == 0 and out.exists() and out.stat().st_size > 2000
 
+    @staticmethod
+    def _parse_vision(text: str) -> tuple[str, str, list[str], str]:
+        title, summary, keywords, detail = "", "", [], ""
+        for line in (text or "").splitlines():
+            s = line.strip().lstrip("-*# ").strip()
+            for label, sep in (("标题", "："), ("摘要", "："), ("关键词", "："), ("细节", "：")):
+                if s.startswith(label):
+                    body = s.split(sep, 1)[-1].strip() if sep in s else s[len(label):].strip(" ：:")
+                    if label == "标题":
+                        title = body[:30]
+                    elif label == "摘要":
+                        summary = body
+                    elif label == "关键词":
+                        keywords = [k for k in re.split(r"[、,，;；/\s]+", body) if k]
+                    else:
+                        detail = body
+                    break
+        if not summary:
+            summary = (text or "").strip()
+        if not title:
+            title = summary.split("。")[0][:14] or "这一段"
+        return title, summary, keywords[:6], detail
+
+    def _chapters(self, segments: list[dict]) -> list[dict]:
+        out = []
+        for seg in segments:
+            out.append({
+                "i": int(seg.get("index", 0)) + 1,
+                "start": float(seg.get("start", 0)),
+                "end": float(seg.get("end", 0)),
+                "title": seg.get("title") or f"第 {int(seg.get('index', 0)) + 1} 段",
+                "keywords": seg.get("keywords") or [],
+                "summary": seg.get("summary", ""),
+            })
+        return out
+
+    # ---------- current (上次看过的片子) ----------
+    def _state_path(self) -> Path:
+        return self.base / "state.json"
+
+    def _load_state(self) -> dict:
+        try:
+            return json.loads(self._state_path().read_text("utf-8"))
+        except Exception:
+            return {}
+
+    def _save_state(self, **kw):
+        data = self._load_state()
+        data.update(kw)
+        try:
+            self._state_path().write_text(json.dumps(data, ensure_ascii=False, indent=1), "utf-8")
+        except Exception:
+            pass
+
+    def _current_log(self):
+        if self.job and self.job.get("logdata"):
+            return self.job["logdata"]
+        cur = str(self._load_state().get("current") or "")
+        if cur:
+            log = self._log_by_name(cur)
+            if log:
+                return log
+        return self._latest_log()
+
+    def _use_name(self, name: str):
+        """切到某个已看过的片子，返回 log 或 None。"""
+        log = self._log_by_name(name)
+        if log:
+            try:
+                self._save_state(current=str(self._resolve(name)))
+            except Exception:
+                pass
+        return log
+
+    def _log_by_name(self, name: str):
+        """按文件名找已缓存的 log（支持 /kv chapters full4.mp4）。"""
+        try:
+            path = self._resolve(name)
+        except Exception:
+            return None
+        cd = self._cache_dir(path)
+        lp = cd / "log.json"
+        if not lp.is_file():
+            return None
+        try:
+            data = json.loads(lp.read_text("utf-8"))
+            data["_path"] = str(lp)
+            return data
+        except Exception:
+            return None
+
+    def _latest_log(self):
+        """默认取“看得最完整”的那份：段数最多，其次时长最长。"""
+        best, best_key = None, None
+        try:
+            for p in self.cache_root.glob("*/log.json"):
+                try:
+                    data = json.loads(p.read_text("utf-8"))
+                except Exception:
+                    continue
+                key = (len(data.get("segments") or []), float(data.get("duration") or 0))
+                if best_key is None or key > best_key:
+                    best, best_key = data, key
+                    data["_path"] = str(p)
+        except Exception:
+            return None
+        return best
+
     async def vision(self, sheet: Path, timeline: str, transcript: str, idx: int, total: int) -> str:
         provider = self.context.get_using_provider()
         if provider is None:
@@ -486,7 +630,13 @@ class VideoStoryboard(Star):
             prompt += f"\n这一段能听到的台词（转写，可能有错字）：\n{transcript[:1500]}\n"
         else:
             prompt += "\n这一段没有可用的台词转写，只能看画面。\n"
-        prompt += "\n请用 2~3 句话概括这一段，再补一句你最在意的细节。"
+        prompt += (
+            "\n请严格按下面四行输出，不要额外解释：\n"
+            "标题：10 字以内，这一段在讲什么\n"
+            "摘要：2~3 句话概括这一段\n"
+            "关键词：3~6 个，用、分隔\n"
+            "细节：一句你最在意的细节"
+        )
         resp = await provider.text_chat(
             prompt=prompt,
             system_prompt=SYSTEM_PROMPT,
@@ -520,7 +670,10 @@ class VideoStoryboard(Star):
             return ""
         lines = []
         for s in segments:
-            lines.append(f"[{self._ts(s['start'])}-{self._ts(s['end'])}] {s.get('summary', '')}")
+            head = s.get("title") or ""
+            lines.append(
+                f"[{self._ts(s['start'])}-{self._ts(s['end'])}] {head}：{s.get('summary', '')}"
+            )
         resp = await provider.text_chat(
             prompt=FINAL_PROMPT + "\n\n" + "\n".join(lines),
         )
@@ -533,6 +686,8 @@ class VideoStoryboard(Star):
         dur = max(1.0, b - a)
         cuts = await self.scene_cuts(path, seg_start + a, dur)
         per = int(self._c("zoom_frames", 9) or 9)
+        # 短格子不必抽满：最多每 0.5 秒一帧
+        per = max(2, min(per, int(dur / 0.5) or 2))
         plan = self._plan_times(cuts, dur, per)
         frames = []
         for k, (x, y, mid) in enumerate(plan):
@@ -602,10 +757,10 @@ class VideoStoryboard(Star):
         p = Path(name.strip().strip('"'))
         if p.is_file():
             return p
-        cand = self.watch_dir() / name
+        cand = self._watch_dir() / name
         if cand.is_file():
             return cand
-        raise FileNotFoundError(f"找不到视频：{name}（可以放进 {self.watch_dir()}）")
+        raise FileNotFoundError(f"找不到视频：{name}（可以放进 {self._watch_dir()}）")
 
     def _cache_dir(self, path: Path) -> Path:
         h = hashlib.sha1()
@@ -631,13 +786,14 @@ class VideoStoryboard(Star):
         umo = event.unified_msg_origin
         self.job = {
             "name": path.name, "path": path, "umo": umo, "cache": cd, "log": log_path,
-            "stop": False, "segments": done,
+            "stop": False, "segments": done, "event": event,
         }
+        self._save_state(current=str(path))
         if done:
             self.job["start_index"] = len(done)
         task = asyncio.create_task(self._worker(limit_segments))
         self.job["task"] = task
-        return f"开始看《{path.name}》，共 {self._ts(self.job.get('duration', 0)) or '?'}；每段看完我会说一句。"
+        return f"开始看《{path.name}》；先把时长和镜头扫一遍，然后每看完一段我说一句。"
 
     async def _worker(self, limit_segments: int):
         job = self.job
@@ -660,22 +816,30 @@ class VideoStoryboard(Star):
             zoom_on = bool(self._c("zoom_enable", True))
             auto_zoom = bool(self._c("auto_zoom", True))
             done = job["segments"]
+            try:
+                prev_seg = float(json.loads(job["log"].read_text("utf-8")).get("segment_seconds", 0) or 0)
+            except Exception:
+                prev_seg = 0.0
+            if done and prev_seg > 0 and abs(prev_seg - seg_len) > 0.5:
+                done.clear()
+                job["segments"] = done
+                self._bg_job(job, "分段时长改过了，之前那几段对不上，我重新从头看。")
             start_idx = len(done)
             if start_idx >= total:
                 text = "这个视频之前已经看完了。"
                 if done:
                     text += "\n\n整体印象：" + (await self.final_summary(done))
-                self._bg_say(job["umo"], text)
+                self._bg_job(job, text)
                 return
 
-            self._bg_say(
-                job["umo"],
+            self._bg_job(
+                job,
                 f"开始看了：《{path.name}》{self._ts(info['duration'])}，{total} 段"
                 + (f"（从第 {start_idx + 1} 段接着看）" if start_idx else ""),
             )
             for i in range(start_idx, total):
                 if job["stop"]:
-                    self._bg_say(job["umo"], "好，先看到这。")
+                    self._bg_job(job, "好，先看到这。")
                     return
                 start = i * seg_len
                 end = min(info["duration"], start + seg_len)
@@ -685,9 +849,21 @@ class VideoStoryboard(Star):
                 steps = [f"分镜 {self._ts(start)}-{self._ts(end)}"]
                 cuts = await self.scene_cuts(path, start, dur)
                 plan = self._plan_times(cuts, dur, per)
+                dense = (len(cuts) / max(dur, 1.0)) >= 0.5 and bool(self._c("double_frame", True))
                 frames = []
                 for k, (a, b, mid) in enumerate(plan):
                     fp = seg_dir / f"f{k:02d}.jpg"
+                    if dense:
+                        lo = max(a + 0.1, mid - 0.3)
+                        hi = min(b - 0.1, mid + 0.3)
+                        f1 = seg_dir / f"f{k:02d}a.jpg"
+                        f2 = seg_dir / f"f{k:02d}b.jpg"
+                        ok1 = await self.grab_frame(path, start + lo, f1)
+                        ok2 = await self.grab_frame(path, start + hi, f2)
+                        if ok1 and ok2:
+                            self._pair(f1, f2, fp)
+                            frames.append((fp, f"{k + 1}  {self._ts(start + a)}"))
+                            continue
                     ok = await self.grab_frame(path, start + mid, fp)
                     if ok:
                         frames.append((fp, f"{k + 1}  {self._ts(start + a)}"))
@@ -720,28 +896,50 @@ class VideoStoryboard(Star):
                         summary = f"这一段没看成（{exc}）。"
                 else:
                     summary = "这一段没有抽到可用画面。"
+                title, summary, keywords, detail = self._parse_vision(summary)
                 item = {
                     "index": i, "start": start, "end": end,
+                    "title": title, "keywords": keywords, "detail": detail,
                     "summary": summary, "transcript": transcript[:3000],
                     "sheet": str(sheet) if sheet.exists() else "",
                     "cells": [[round(a, 2), round(b, 2)] for a, b, _m in plan],
                 }
                 done.append(item)
                 job["log"].write_text(
-                    json.dumps({"file": str(path), "duration": info["duration"], "segments": done},
+                    json.dumps({"file": str(path), "duration": info["duration"], "segment_seconds": seg_len, "segments": done},
                                ensure_ascii=False, indent=1),
                     "utf-8",
                 )
-                if push:
+                if push and bool(self._c("push_segment_detail", True)):
                     text_i = f"第 {i + 1}/{total} 段（{self._ts(start)}-{self._ts(end)}）：{summary}"
                     parts = [Plain(text_i)]
                     if sheet.exists():
                         parts.append(AstrImage.fromFileSystem(str(sheet)))
-                    try:
-                        await asyncio.wait_for(self.context.send_message(job["umo"], MessageChain(parts)), timeout=60)
-                    except Exception as exc:
-                        logger.warning(f"发送分段失败：{exc}")
-                        self._bg_say(job["umo"], text_i)
+                    chain = MessageChain(parts)
+                    sent = False
+                    umo_i = str(job.get("umo") or "")
+                    if umo_i and not umo_i.startswith("webchat"):
+                        sent = await self._qq_send(
+                            umo_i.split(":")[-1], text_i, str(sheet) if sheet.exists() else "",
+                            self_id=getattr(job.get("event"), "self_id", None),
+                        )
+                    if not sent:
+                        try:
+                            ev = job.get("event")
+                            if ev is not None and hasattr(ev, "send"):
+                                await asyncio.wait_for(ev.send(chain), timeout=60)
+                                self._log("push_event_ok", f"seg={i + 1}")
+                                sent = True
+                        except Exception as exc:
+                            self._log("push_event_fail", f"{type(exc).__name__}: {exc}")
+                    if not sent:
+                        try:
+                            await asyncio.wait_for(self.context.send_message(job["umo"], chain), timeout=60)
+                            self._log("push_umo_ok", f"seg={i + 1}")
+                        except Exception as exc:
+                            self._log("push_umo_fail", f"{type(exc).__name__}: {exc}")
+                            logger.warning(f"发送分段失败：{exc}")
+                            self._bg_job(job, text_i)
                 if zoom_on and auto_zoom and item.get("cells"):
                     try:
                         z = await self._auto_zoom(job, path, seg_dir, start, plan, cuts,
@@ -762,23 +960,109 @@ class VideoStoryboard(Star):
                             zparts = [Plain(ztext)]
                             if zinfo.get("sheet"):
                                 zparts.append(AstrImage.fromFileSystem(zinfo["sheet"]))
-                            try:
-                                await asyncio.wait_for(self.context.send_message(job["umo"], MessageChain(zparts)), timeout=60)
-                            except Exception as exc:
-                                logger.warning(f"发送细分失败：{exc}")
+                            zchain = MessageChain(zparts)
+                            ev = job.get("event")
+                            if ev is not None and hasattr(ev, "send"):
+                                if not await self._send_event(ev, zchain):
+                                    self._bg_job(job, ztext)
+                            else:
+                                try:
+                                    await asyncio.wait_for(self.context.send_message(job["umo"], zchain), timeout=60)
+                                except Exception as exc:
+                                    logger.warning(f"发送细分失败：{exc}")
                     except Exception as exc:
                         logger.warning(f"细分失败：{exc}")
             overall = await self.final_summary(done)
+            chapters = self._chapters(done)
+            try:
+                job["log"].write_text(
+                    json.dumps({"file": str(path), "duration": info["duration"], "segment_seconds": seg_len,
+                                "segments": done,
+                                "film": {"overview": overall, "chapters": chapters}},
+                               ensure_ascii=False, indent=1),
+                    "utf-8",
+                )
+            except Exception:
+                pass
             text = f"看完了，共 {total} 段。"
             if overall:
                 text += "\n\n" + overall
-            self._bg_say(job["umo"], text)
+            self._bg_job(job, text)
         except Exception as exc:
+            self._log("worker_crash", f"{type(exc).__name__}: {exc}")
             logger.exception("视频任务失败")
             await self._say(job["umo"], f"看到一半出错了：{exc}")
         finally:
             if self.job:
                 self.job["task"] = asyncio.create_task(asyncio.sleep(0))
+
+    async def _qq_send(self, uid: str, text: str, image: str = "", self_id=None) -> bool:
+        """直接用 aiocqhttp 的 CQHttp 客户端发私聊，绕开 umo/事件对象。"""
+        try:
+            plat = self.context.get_platform("aiocqhttp")
+        except Exception as exc:
+            self._log("qq_send_plat_fail", f"{type(exc).__name__}: {exc}")
+            return False
+        if plat is None:
+            self._log("qq_send_plat_none", "aiocqhttp 平台未加载")
+            return False
+        try:
+            if not str(uid).isdigit():
+                self._log("qq_send_bad_uid", str(uid)[:40])
+                return False
+            cli = plat.get_client()
+            msg = []
+            if text:
+                msg.append({"type": "text", "data": {"text": text}})
+            if image:
+                msg.append({"type": "image", "data": {"file": Path(image).resolve().as_uri()}})
+            if not msg:
+                return False
+            kwargs = {"user_id": int(uid), "message": msg}
+            if self_id:
+                kwargs["self_id"] = int(self_id)
+            await asyncio.wait_for(cli.send_private_msg(**kwargs), timeout=60)
+            self._log("qq_send_ok", f"uid={uid} img={'y' if image else 'n'}")
+            return True
+        except Exception as exc:
+            self._log("qq_send_fail", f"{type(exc).__name__}: {exc}")
+            logger.warning(f"CQHttp 直发失败：{exc}")
+            return False
+
+    async def _send_event(self, event, chain):
+        try:
+            await asyncio.wait_for(event.send(chain), timeout=60)
+            return True
+        except Exception as exc:
+            self._log("event_send_fail", f"{type(exc).__name__}: {exc}")
+            logger.warning(f"event.send 失败：{exc}")
+            return False
+
+    def _bg_job(self, job, text: str, chain=None):
+        async def run():
+            umo = str(job.get("umo") or "")
+            if umo and not umo.startswith("webchat"):
+                if await self._qq_send(umo.split(":")[-1], text or "",
+                                        self_id=getattr(job.get("event"), "self_id", None)):
+                    return
+            try:
+                ev = job.get("event")
+                if ev is not None and hasattr(ev, "send"):
+                    await asyncio.wait_for(ev.send(chain or MessageChain([Plain(text)])), timeout=60)
+                    self._log("push_event_ok", (text or "")[:20])
+                    return
+            except Exception as exc:
+                self._log("push_event_fail", f"{type(exc).__name__}: {exc}")
+            try:
+                await asyncio.wait_for(
+                    self.context.send_message(job["umo"], chain or MessageChain([Plain(text)])), timeout=60
+                )
+                self._log("push_umo_ok", (text or "")[:20])
+            except Exception as exc:
+                self._log("push_umo_fail", f"{type(exc).__name__}: {exc}")
+
+        task = asyncio.create_task(run())
+        self.__dict__.setdefault("_bg_tasks", set()).add(task)
 
     def _bg_say(self, umo: str, text: str):
         task = asyncio.create_task(self._say(umo, text))
@@ -796,6 +1080,7 @@ class VideoStoryboard(Star):
     # ---------- commands ----------
     @filter.command("kv", priority=12000)
     async def kv(self, event: AstrMessageEvent):
+        self._dbg("kv", event)
         event.stop_event()
         raw = (event.message_str or "").strip()
         args = raw.split()
@@ -808,8 +1093,115 @@ class VideoStoryboard(Star):
                 "/kv 文件名.mp4 —— 开始看（放到视频文件夹里）\n"
                 "/kv 文件 2 —— 只看前 2 段\n"
                 "/kv zoom 3 5 —— 把第 3 段第 5 格再切成 9 小格细看\n"
+                "/kv chapters —— 列上次看的那部片的章节目录\n"
+                "/kv chapters 文件名.mp4 —— 换成另一部已看过的片子\n"
+                "/kv use 文件名.mp4 —— 切换当前片子\n"
+                "/kv jump 90:00 或 /kv jump 反转 —— 跳到某一时刻/某个话题，回看那一段\n"
+                "/kv ask 这电影讲了什么 —— 基于已看的段落回答问题\n"
                 "/kv status —— 进度\n/kv stop —— 停\n/kv list —— 文件夹里有什么"
             )
+            return
+        if sub in ("chapters", "chapter", "ch", "toc"):
+            name = next((a for a in args[2:] if "." in a), "")
+            log = self._use_name(name) if name else self._current_log()
+            if not log:
+                yield event.plain_result("还没有看完的视频。先用 /kv 文件名 看一个。")
+                return
+            chapters = self._chapters(log.get("segments") or [])
+            if not chapters:
+                yield event.plain_result("这个视频还没有分段记录。")
+                return
+            lines = [f"{c['i']}. {self._ts(c['start'])}-{self._ts(c['end'])}  {c['title']}"
+                     for c in chapters]
+            title = Path(str(log.get("file") or "")).name or "当前片子"
+            yield event.plain_result(f"章节目录（{title}）：\n" + "\n".join(lines))
+            return
+        if sub == "jump":
+            arg = " ".join(a for a in args[2:] if "." not in a).strip()
+            if not arg:
+                yield event.plain_result("用法：/kv jump 90:00 或 /kv jump 反转")
+                return
+            name = next((a for a in args[2:] if "." in a), "")
+            log = self._use_name(name) if name else self._current_log()
+            if not log:
+                yield event.plain_result("还没有看完的视频。")
+                return
+            seg = self._pick_segment(log, arg)
+            if not seg:
+                yield event.plain_result("没找到那一段，试试 /kv chapters 看目录。")
+                return
+            yield event.plain_result(
+                f"第 {int(seg.get('index', 0)) + 1} 段（{self._ts(float(seg['start']))}-{self._ts(float(seg['end']))}）"
+                f" {seg.get('title', '')}：{seg.get('summary', '')}"
+            )
+            sheet = seg.get("sheet")
+            if sheet and Path(sheet).is_file():
+                try:
+                    await self._send_event(event, MessageChain([AstrImage.fromFileSystem(sheet)]))
+                except Exception as exc:
+                    logger.warning(f"发送段落图失败：{exc}")
+            return
+        if sub == "ask":
+            question = " ".join(a for a in args[2:] if "." not in a).strip()
+            if not question:
+                yield event.plain_result("用法：/kv ask 这电影讲了什么")
+                return
+            name = next((a for a in args[2:] if "." in a), "")
+            log = self._use_name(name) if name else self._current_log()
+            if not log:
+                yield event.plain_result("还没有看完的视频。先用 /kv 看一个。")
+                return
+            segs = log.get("segments") or []
+            if not segs:
+                yield event.plain_result("这个视频还没有分段记录。")
+                return
+            picked = self._retrieve(segs, question)
+            provider = self.context.get_using_provider()
+            if provider is None:
+                yield event.plain_result("没有可用的模型。")
+                return
+            blocks = []
+            for s in picked:
+                blocks.append(
+                    f"[{self._ts(float(s['start']))}-{self._ts(float(s['end']))}] "
+                    f"{s.get('title', '')}：{s.get('summary', '')}\n"
+                    f"台词节选：{(s.get('transcript') or '')[:600]}"
+                )
+            prompt = (
+                "下面是机器人之前分段看过的视频内容（带时间）。请只根据这些内容回答用户的问题，"
+                "回答里尽量带上时间点；不确定就直说没看到。\n\n"
+                + "\n\n".join(blocks)
+                + f"\n\n用户的问题：{question}"
+            )
+            try:
+                resp = await provider.text_chat(prompt=prompt)
+                answer = str(getattr(resp, "completion_text", "") or "").strip()
+            except Exception as exc:
+                yield event.plain_result(f"回答失败：{exc}")
+                return
+            yield event.plain_result(answer or "没整理出答案。")
+            return
+        if sub in ("ping", "test"):
+            uid = ((args[2] if len(args) > 2 else "").strip()
+                   or str(self._c("admin_qq", "") or "")
+                   or (event.unified_msg_origin or "").split(":")[-1])
+            if not uid:
+                yield event.plain_result("用法：/kv ping 342202362")
+                return
+            ok = await self._qq_send(uid, "推送自测：这条能收到，进度和图就能收到。",
+                                     self_id=getattr(event, "self_id", None))
+            yield event.plain_result("已发送，看看 QQ 收到没有。" if ok else "发送失败，看日志 qq_send_fail。")
+            return
+        if sub in ("use", "switch"):
+            name = " ".join(args[2:]).strip()
+            if not name:
+                yield event.plain_result("用法：/kv use 文件名.mp4")
+                return
+            log = self._use_name(name)
+            if not log:
+                yield event.plain_result(f"没找到《{name}》的观看记录，先用 /kv {name} 看一遍。")
+                return
+            yield event.plain_result(f"好，当前片子切成《{name}》了。")
             return
         if sub == "status":
             if not self.job:
@@ -830,7 +1222,7 @@ class VideoStoryboard(Star):
                 yield event.plain_result("本来就没在看。")
             return
         if sub == "list":
-            files = [p.name for p in sorted(self.watch_dir().iterdir()) if p.is_file()]
+            files = [p.name for p in sorted(self._watch_dir().iterdir()) if p.is_file()]
             yield event.plain_result("文件夹里：\n" + ("\n".join(files) if files else "（空）"))
             return
         if sub == "zoom":
@@ -855,10 +1247,7 @@ class VideoStoryboard(Star):
             if hit:
                 yield event.plain_result(f"第 {seg_i + 1} 段第 {cell_i + 1} 格：{hit.get('summary', '')}")
                 try:
-                    await self.context.send_message(
-                        event.unified_msg_origin,
-                        MessageChain([AstrImage.fromFileSystem(hit["sheet"])]),
-                    )
+                    await self._send_event(event, MessageChain([AstrImage.fromFileSystem(hit["sheet"])]))
                 except Exception as exc:
                     logger.warning(f"发送细分图失败：{exc}")
                 return
@@ -888,10 +1277,7 @@ class VideoStoryboard(Star):
             yield event.plain_result(f"第 {seg_i + 1} 段第 {cell_i + 1} 格：{info['summary']}")
             if info.get("sheet"):
                 try:
-                    await self.context.send_message(
-                        event.unified_msg_origin,
-                        MessageChain([AstrImage.fromFileSystem(info["sheet"])]),
-                    )
+                    await self._send_event(event, MessageChain([AstrImage.fromFileSystem(info["sheet"])]))
                 except Exception as exc:
                     logger.warning(f"发送细分图失败：{exc}")
             return
@@ -906,6 +1292,45 @@ class VideoStoryboard(Star):
         msg = await self.start_job(event, path, limit)
         yield event.plain_result(msg)
 
+    def _pick_segment(self, log: dict, arg: str):
+        segs = log.get("segments") or []
+        seconds = None
+        m = re.search(r"(\d{1,3}):(\d{2})(?::(\d{2}))?", arg)
+        if m:
+            if m.group(3) is not None:
+                seconds = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + int(m.group(3))
+            else:
+                seconds = int(m.group(1)) * 60 + int(m.group(2))
+        else:
+            m2 = re.search(r"(\d+)\s*(?:分|分钟)", arg)
+            if m2:
+                seconds = int(m2.group(1)) * 60
+        if seconds is not None:
+            for s in segs:
+                if float(s.get("start", 0)) <= seconds < float(s.get("end", 0)):
+                    return s
+            return None
+        return self._retrieve(segs, arg, limit=1)[0] if self._retrieve(segs, arg, limit=1) else None
+
+    def _retrieve(self, segs: list[dict], query: str, limit: int = 3) -> list[dict]:
+        q = (query or "").lower()
+        tokens = [w for w in re.split(r"[\s，。？?！!、,;；:：]+", q) if len(w) >= 2]
+        scored = []
+        for s in segs:
+            text = " ".join([
+                str(s.get("title", "")), str(s.get("summary", "")),
+                " ".join(s.get("keywords") or []), str(s.get("transcript", ""))[:1500],
+            ]).lower()
+            score = sum(text.count(w) for w in tokens) if tokens else 0
+            if q and q in text:
+                score += 3
+            scored.append((score, s))
+        scored.sort(key=lambda x: (-x[0], float(x[1].get("start", 0))))
+        picked = [s for sc, s in scored[:limit] if sc > 0]
+        if not picked:
+            picked = [s for _sc, s in scored[:min(2, len(scored))]]
+        return picked
+
     VIDEO_SUFFIXES = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".ts", ".m4v", ".wmv")
 
     def _search_name(self, name: str):
@@ -913,7 +1338,7 @@ class VideoStoryboard(Star):
             return None
         dirs = [
             self._watch_dir(),
-            self.base / "data" / "inbox",
+            self.base / "inbox",
         ]
         for d in dirs:
             try:
@@ -931,7 +1356,7 @@ class VideoStoryboard(Star):
 
     async def _materialize(self, comp):
         """把 QQ 视频/文件组件变成本地文件；拿不到就返回 None。"""
-        inbox = self.base / "data" / "inbox"
+        inbox = self.base / "inbox"
         inbox.mkdir(parents=True, exist_ok=True)
         cands = []
         for attr in ("file", "path", "url"):
@@ -980,7 +1405,29 @@ class VideoStoryboard(Star):
         return None
 
     @filter.event_message_type(filter.EventMessageType.ALL, priority=12000)
+    def _log(self, tag: str, msg: str) -> None:
+        try:
+            with open(self.base / "debug_events.log", "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%H:%M:%S')} {tag} {msg}\n")
+        except Exception:
+            pass
+
+    def _dbg(self, tag: str, event) -> None:
+        try:
+            comps = [type(c).__name__ for c in (event.message_obj.message or [])]
+            line = f"{time.strftime('%H:%M:%S')} {tag} str={event.message_str!r} comps={comps}\n"
+            with open(self.base / "debug_events.log", "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            pass
+
+    async def terminate(self):
+        if self.job:
+            self.job["stop"] = True
+            logger.info("video storyboard: job marked stop before unload")
+
     async def on_video(self, event: AstrMessageEvent):
+        self._dbg("on_video", event)
         raw = (event.message_str or "").strip()
         try:
             _n = len(event.get_messages() or [])
@@ -998,7 +1445,6 @@ class VideoStoryboard(Star):
             return
         if not comps:
             return
-        self._debug_inbox(comps)
         for comp in comps:
             kind = type(comp).__name__
             if kind not in ("Video", "File"):

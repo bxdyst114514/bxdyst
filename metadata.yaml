@@ -1,4 +1,4 @@
-name: astrbot_plugin_video_storyboard
+﻿name: astrbot_plugin_video_storyboard
 display_name: 分段看视频
 short_desc: 让机器人一段一段看完你的视频：分镜抽帧、语音转写、逐段点评。
 desc: |
@@ -11,7 +11,7 @@ desc: |
   - 视频可以放进指定文件夹用 `/kv 文件名` 打开，也可以直接在 QQ 里发给机器人；
   - 语音转写用 SenseVoice（可选，未配置时只看画面）；
   - 参数可在插件页面的「参数设置」里热改，下一段生效。
-version: 0.3.0
+version: 0.4.1
 author: xiaoman
 repo: https://github.com/bxdyst114514/bxdyst
 astrbot_version: ">=4.22.0"

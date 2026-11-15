@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>看视频参数</title>
+<title>参数设置</title>
 <style>
   :root {
     --bg: #0b0f17;
@@ -52,21 +52,39 @@
     border-radius: 50%; background: #fff; transition: .18s;
   }
   .toggle.on::after { left: 23px; }
-  .actions { display: flex; gap: 10px; align-items: center; }
-  button {
-    border: 0; border-radius: 10px; padding: 10px 18px; font-size: 14px;
-    cursor: pointer; background: var(--accent); color: #06121f; font-weight: 700;
+  .seg {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
+    grid-column: 1 / -1;
   }
+  .seg button {
+    background: var(--card2); color: var(--dim); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 8px; cursor: pointer; font-size: 13px;
+    font-weight: 600; text-align: center;
+  }
+  .seg button small { display: block; font-weight: 400; font-size: 11px; margin-top: 2px; }
+  .seg button.on { background: rgba(62,166,255,.14); border-color: var(--accent); color: var(--text); }
+  .actions { display: flex; gap: 10px; align-items: center; }
+  button.primary, button.ghost {
+    border: 0; border-radius: 10px; padding: 10px 18px; font-size: 14px; cursor: pointer;
+  }
+  button.primary { background: var(--accent); color: #06121f; font-weight: 700; }
   button.ghost { background: transparent; color: var(--dim); border: 1px solid var(--line); }
   #msg { font-size: 13px; }
   #msg.ok { color: var(--ok); }
   #msg.err { color: var(--err); }
-  .hint { color: var(--dim); font-size: 12px; margin-top: 10px; }
+  .cmds { display: grid; gap: 8px; }
+  .cmd {
+    display: grid; grid-template-columns: 190px 1fr; gap: 10px;
+    padding: 8px 10px; background: var(--card2); border-radius: 9px;
+    font-size: 13px;
+  }
+  .cmd code { color: #9ecbff; font-family: Consolas, monospace; }
+  .cmd span { color: var(--dim); }
 </style>
 </head>
 <body>
   <h1>分段看视频 · 参数</h1>
-  <div class="sub">改完点保存即可，不用重启；正在跑的这一次会用旧参数收尾，下一次生效。</div>
+  <div class="sub">改完点保存即可，不用重启；正在跑的这一段会用旧参数收尾，下一段生效。</div>
 
   <div class="card">
     <h2>分段与抽帧</h2>
@@ -82,6 +100,10 @@
       <div class="label"><b>切镜灵敏度</b><span>0.2 更碎，0.5 更粗；默认 0.3</span></div>
       <input id="scene_threshold" type="number" min="0.1" max="0.9" step="0.05" />
     </div>
+    <div class="row">
+      <div class="label"><b>快剪双联帧</b><span>平均镜头 &lt; 2 秒时，每格用前后两帧左右拼图</span></div>
+      <div class="toggle" id="double_frame"></div>
+    </div>
   </div>
 
   <div class="card">
@@ -95,13 +117,13 @@
       <div class="toggle" id="zoom_enable"></div>
     </div>
     <div class="row">
-      <div class="label"><b>特写格数</b><span>默认 9，范围为几十秒</span></div>
+      <div class="label"><b>特写格数</b><span>默认 9；格子很短时自动减少，每 0.5 秒最多一帧</span></div>
       <input id="zoom_frames" type="number" min="2" max="16" step="1" />
     </div>
   </div>
 
   <div class="card">
-    <h2>听声音与推送</h2>
+    <h2>听声音</h2>
     <div class="row">
       <div class="label"><b>语音转写</b><span>关掉就只看画面、没有说话内容</span></div>
       <div class="toggle" id="asr_enable"></div>
@@ -117,34 +139,58 @@
         <option value="yue">粤语</option>
       </select>
     </div>
-    <div class="row">
-      <div class="label"><b>逐段推送进度</b><span>每段看完就发图 + 摘要</span></div>
-      <div class="toggle" id="push_progress"></div>
+  </div>
+
+  <div class="card">
+    <h2>推送方式</h2>
+    <div class="row" style="grid-template-columns:1fr">
+      <div class="label"><b>看完后发什么</b><span>三种模式互斥，选一个就行</span></div>
+      <div class="seg" id="push_mode">
+        <button data-mode="off">不推送<small>只在 /kv status 里看进度</small></button>
+        <button data-mode="summary">只发整体印象<small>全部看完后一条总结</small></button>
+        <button data-mode="segment">逐段推送<small>每段图 + 感想，最后再来总结</small></button>
+      </div>
     </div>
   </div>
 
   <div class="card">
-    <h2>目录</h2>
+    <h2>目录与范围</h2>
     <div class="row">
-      <div class="label"><b>视频文件夹</b><span>大文件丢这里，然后 /kv 文件名</span></div>
-      <input id="watch_dir" type="text" placeholder="留空则用插件 data/inbox" />
+      <div class="label"><b>视频文件夹</b><span>大文件丢这里，然后 /kv 文件名；留空用插件 inbox</span></div>
+      <input id="watch_dir" type="text" placeholder="D:\xiaoman-videos" />
     </div>
     <div class="row">
       <div class="label"><b>单次最多段数</b><span>0 表示不限</span></div>
       <input id="max_segments_per_run" type="number" min="0" max="999" step="1" />
     </div>
-    <div class="hint">命令：<code>/kv 文件名</code>、<code>/kv zoom 段 格</code>、<code>/kv status</code>、<code>/kv stop</code></div>
+  </div>
+
+  <div class="card">
+    <h2>指令合集</h2>
+    <div class="cmds">
+      <div class="cmd"><code>/kv 文件名</code><span>开始看（可加段数，如 <code>/kv 片子.mp4 3</code>）</span></div>
+      <div class="cmd"><code>/kv status</code><span>看当前进度</span></div>
+      <div class="cmd"><code>/kv stop</code><span>当前段看完后停</span></div>
+      <div class="cmd"><code>/kv list</code><span>列出看过的视频（缓存）</span></div>
+      <div class="cmd"><code>/kv use 文件名</code><span>切换“当前视频”，后面章节/跳转不用重复写文件名</span></div>
+      <div class="cmd"><code>/kv chapters</code><span>章节索引（时间 + 标题）</span></div>
+      <div class="cmd"><code>/kv jump 12:30</code><span>跳到某个时间点，返回那一段的摘要和九宫格</span></div>
+      <div class="cmd"><code>/kv zoom 3 5</code><span>第 3 段第 5 格展开特写</span></div>
+      <div class="cmd"><code>/kv ask 这片讲了什么</code><span>按记忆检索后回答（会带时间点）</span></div>
+    </div>
   </div>
 
   <div class="actions">
-    <button id="save">保存</button>
+    <button class="primary" id="save">保存</button>
     <button class="ghost" id="reload">重新读取</button>
     <span id="msg"></span>
   </div>
 
 <script>
-  const BOOLS = ["zoom_enable", "auto_zoom", "asr_enable", "push_progress"];
+  const BOOLS = ["zoom_enable", "auto_zoom", "asr_enable", "double_frame"];
+  const NUMS = ["segment_seconds", "frames_per_segment", "scene_threshold", "zoom_frames", "max_segments_per_run"];
   const msg = document.getElementById("msg");
+  let pushMode = "segment";
 
   function setMsg(text, ok) {
     msg.textContent = text || "";
@@ -157,7 +203,7 @@
       if (api && typeof api.apiGet === "function") return api;
       await new Promise((r) => setTimeout(r, 100));
     }
-    throw new Error("页面桥未就绪，请刷新面板重试");
+    throw new Error("页面桥未就绪，请刷新后重试");
   }
 
   function paintToggle(el, on) {
@@ -165,14 +211,29 @@
     el.dataset.on = on ? "1" : "0";
   }
 
+  function paintMode(mode) {
+    pushMode = mode;
+    for (const btn of document.querySelectorAll("#push_mode button")) {
+      btn.classList.toggle("on", btn.dataset.mode === mode);
+    }
+  }
+
   function render(cfg) {
     for (const key of BOOLS) {
-      paintToggle(document.getElementById(key), cfg[key]);
+      const el = document.getElementById(key);
+      if (el) paintToggle(el, cfg[key]);
     }
-    for (const key of ["segment_seconds","frames_per_segment","scene_threshold","zoom_frames","max_segments_per_run","watch_dir","asr_language"]) {
+    for (const key of NUMS) {
       const el = document.getElementById(key);
       if (el) el.value = cfg[key] ?? "";
     }
+    const wd = document.getElementById("watch_dir");
+    if (wd) wd.value = cfg.watch_dir ?? "";
+    const lang = document.getElementById("asr_language");
+    if (lang) lang.value = cfg.asr_language || "auto";
+    const progress = !!cfg.push_progress;
+    const detail = !!cfg.push_segment_detail;
+    paintMode(!progress ? "off" : detail ? "segment" : "summary");
   }
 
   async function load() {
@@ -193,22 +254,25 @@
     for (const key of BOOLS) {
       payload[key] = document.getElementById(key).dataset.on === "1";
     }
-    for (const key of ["segment_seconds","frames_per_segment","scene_threshold","zoom_frames","max_segments_per_run"]) {
+    for (const key of NUMS) {
       payload[key] = Number(document.getElementById(key).value || 0);
     }
     payload.watch_dir = document.getElementById("watch_dir").value.trim();
     payload.asr_language = document.getElementById("asr_language").value;
+    payload.push_progress = pushMode !== "off";
+    payload.push_segment_detail = pushMode === "segment";
+
     setMsg("保存中…");
     try {
       const api = await bridge();
       const query = {};
       for (const [k, v] of Object.entries(payload)) query[k] = String(v);
       const data = await api.apiGet("page/config/set", query);
-      if (data && data.ok) {
+      if (data && (data.ok || data.status === "ok")) {
         render(data.config || payload);
         setMsg("已保存，下一段起生效", true);
       } else {
-        setMsg("保存失败", false);
+        setMsg("保存失败: " + ((data && data.message) || "未知错误"), false);
       }
     } catch (err) {
       setMsg("保存失败: " + (err && err.message || err), false);
@@ -218,6 +282,9 @@
   for (const key of BOOLS) {
     const el = document.getElementById(key);
     el.addEventListener("click", () => paintToggle(el, el.dataset.on !== "1"));
+  }
+  for (const btn of document.querySelectorAll("#push_mode button")) {
+    btn.addEventListener("click", () => paintMode(btn.dataset.mode));
   }
   document.getElementById("save").addEventListener("click", save);
   document.getElementById("reload").addEventListener("click", load);
