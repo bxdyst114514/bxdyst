@@ -141,5 +141,11 @@
     "type": "bool",
     "default": true,
     "hint": "约 1 秒/帧，长片会明显变慢；关掉就退回语音转写"
+  },
+  "max_gap_seconds": {
+    "description": "最大盲区（秒）",
+    "type": "int",
+    "default": 8,
+    "hint": "每段窗口 ÷ 格数超过这个秒数就自动补格（上限 36）；调小更密更贵，调大更省但可能漏看。"
   }
 }

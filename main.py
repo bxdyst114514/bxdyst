@@ -20,6 +20,7 @@ from astrbot.api.message_components import Image as AstrImage, Plain, Video
 from astrbot.api.star import Context, Star, register
 
 try:
+    import numpy as np
     from PIL import Image, ImageDraw
 except Exception:  # pragma: no cover
     Image = None
@@ -65,7 +66,7 @@ for line in sys.stdin:
                     t = ""
                 if t:
                     texts.append(t)
-        sys.stdout.buffer.write((json.dumps({"text": " ".join(texts)}, ensure_ascii=False) + "\n").encode("utf-8"))
+        sys.stdout.buffer.write((json.dumps({"text": " ".join(texts), "chunks": texts}, ensure_ascii=False) + "\n").encode("utf-8"))
     except Exception as exc:
         sys.stdout.buffer.write((json.dumps({"text": "", "error": str(exc)}, ensure_ascii=False) + "\n").encode("utf-8"))
     sys.stdout.buffer.flush()
@@ -98,6 +99,7 @@ class VideoStoryboard(Star):
     PAGE_KEYS = {
         "segment_seconds": int,
         "frames_per_segment": int,
+        "max_gap_seconds": int,
         "scene_threshold": float,
         "zoom_enable": bool,
         "auto_zoom": bool,
@@ -451,7 +453,7 @@ class VideoStoryboard(Star):
             logger.info("完成 %s", name)
         return folder
 
-    def transcribe(self, wav: Path, lang: str) -> str:
+    def transcribe(self, wav: Path, lang: str) -> tuple[str, list[str]]:
         py = str(self._c("asr_python", "") or "").strip()
         if not py or not Path(py).is_file():
             py = sys.executable
@@ -507,7 +509,9 @@ class VideoStoryboard(Star):
             raise RuntimeError(data["error"])
         text = str(data.get("text") or "")
         text = re.sub(r"<\|[^|]+\|>", "", text).strip()
-        return text
+        chunks = [re.sub(r"<\|[^|]+\|>", "", str(c or "")).strip() for c in (data.get("chunks") or [])]
+        chunks = [c for c in chunks if c]
+        return text, chunks
 
     async def extract_audio(self, path: Path, start: float, dur: float, out: Path) -> bool:
         rc, _, _ = await self._run(
@@ -567,6 +571,39 @@ class VideoStoryboard(Star):
             out.append(" ".join(lines[2:]))
         return "\n".join(out)[:3000]
 
+
+    async def _audio_profile(self, path: Path, start: float, dur: float) -> dict:
+        """声学预检：静音占比 / 平均音量（不依赖 ASR 模型，独立证据）。"""
+        rc, _, err = await self._run(
+            [
+                self.ffmpeg, "-hide_banner", "-nostats", "-loglevel", "info",
+                "-ss", f"{start:.3f}", "-t", f"{max(1.0, dur):.3f}", "-i", str(path),
+                "-vn", "-af", "silencedetect=noise=-35dB:d=0.6,volumedetect",
+                "-f", "null", "-",
+            ],
+            timeout=300,
+        )
+        info = {"ok": rc == 0, "mean_db": None, "speech_ratio": 1.0}
+        if rc != 0 or not err:
+            return info
+        m = re.search(r"mean_volume:\s*(-?[0-9.]+)\s*dB", err)
+        if m:
+            info["mean_db"] = float(m.group(1))
+        sil, cur = 0.0, None
+        for line in err.splitlines():
+            m = re.search(r"silence_start:\s*(-?[0-9.]+)", line)
+            if m:
+                cur = max(0.0, float(m.group(1)))
+                continue
+            m = re.search(r"silence_end:\s*(-?[0-9.]+)", line)
+            if m and cur is not None:
+                sil += max(0.0, float(m.group(1)) - cur)
+                cur = None
+        if cur is not None:
+            sil += max(0.0, dur - cur)
+        info["speech_ratio"] = max(0.0, min(1.0, 1.0 - sil / max(1.0, dur)))
+        return info
+
     async def _ocr_window(self, path: Path, start: float, end: float, work: Path) -> str:
         band = float(self._c("ocr_band", 0.24) or 0.24)
         fps = float(self._c("ocr_fps", 0.4) or 0.4)
@@ -577,7 +614,7 @@ class VideoStoryboard(Star):
         rc, _, _ = await self._run(
             [self.ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
              "-ss", f"{start:.3f}", "-t", f"{max(1.0, end - start):.3f}", "-i", str(path),
-             "-vf", f"fps={fps},crop=iw:trunc(ih*{band:.2f}/2)*2:0:trunc(ih*{max(0.0, 0.96 - band):.2f}/2)*2,scale=960:-2",
+             "-vf", f"fps={fps},crop=iw:trunc(ih*{band:.2f}/2)*2:0:trunc(ih*{max(0.0, 0.96 - band):.2f}/2)*2,scale=iw:ih",
              "-q:v", "4", str(tmp / "c%04d.jpg")], timeout=900)
         if rc != 0:
             return ""
@@ -593,7 +630,12 @@ class VideoStoryboard(Star):
             frames = []
             for img in sorted(tmp.glob("*.jpg")):
                 try:
-                    res, _ = engine(str(img))
+                    im = Image.open(img).convert("RGB")
+                    if im.height < 180 and im.width < 1600:
+                        scale = min(2.0, 2400.0 / max(1, im.width))
+                        im = im.resize((int(im.width * scale), int(im.height * scale)), Image.LANCZOS)
+                    arr = np.asarray(im)
+                    res, _ = engine(arr)
                 except Exception:
                     continue
                 lines = []
@@ -609,14 +651,33 @@ class VideoStoryboard(Star):
             return frames
 
         frames = await asyncio.to_thread(run_ocr)
+        import difflib
+
+        def norm(x):
+            x = "".join(ch for ch in x if ch.isprintable())
+            return x.strip(" \t\"'\u201c\u201d\u2018\u2019\u300c\u300d\u300e\u300f-\u2014\u2026")
+
+        def keep(line):
+            if len(line) < 3:
+                return False
+            han = sum(1 for c in line if 0x4E00 <= ord(c) <= 0x9FFF)
+            kana = sum(1 for c in line if 0x3040 <= ord(c) <= 0x30FF)
+            if han or kana:
+                return True
+            # 纯拉丁：过滤 UI/水印类全大写短词
+            return len(line) >= 6 and not line.isupper()
+
         merged = []
         for lines in frames:
             if not lines:
                 continue
-            zh = [x for x in lines if han(x) >= 2 and kana(x) == 0]
-            pick = max(zh, key=han) if zh else " ".join(lines)
-            key = "".join(ch for ch in pick if ch.isalnum())
-            if merged and key == "".join(ch for ch in merged[-1] if ch.isalnum()):
+            cand = [norm(x) for x in lines]
+            cand = [x for x in cand if keep(x)]
+            if not cand:
+                continue
+            zh = [x for x in cand if sum(1 for c in x if 0x4E00 <= ord(c) <= 0x9FFF) >= 2]
+            pick = max(zh, key=lambda x: sum(1 for c in x if 0x4E00 <= ord(c) <= 0x9FFF)) if zh else max(cand, key=len)
+            if any(difflib.SequenceMatcher(None, pick, prev).ratio() >= 0.72 for prev in merged[-3:]):
                 continue
             merged.append(pick)
         return "\n".join(merged)[:3000]
@@ -640,18 +701,32 @@ class VideoStoryboard(Star):
                     logger.warning(f"OCR 失败：{exc}")
         if not asr_on:
             return "", ""
+        dur = max(1.0, end - start)
+        prof = await self._audio_profile(path, start, dur)
+        if prof["speech_ratio"] < 0.12 or (prof["mean_db"] is not None and prof["mean_db"] < -45):
+            logger.info(f"音频预检：无有效人声 (mean={prof['mean_db']}dB ratio={prof['speech_ratio']:.2f})，跳过 ASR")
+            return "", "none"
         wav = work / "a.wav"
-        if await self.extract_audio(path, start, max(1.0, end - start), wav):
+        if await self.extract_audio(path, start, dur, wav):
             try:
-                txt = await asyncio.to_thread(self.transcribe, wav, lang)
+                txt, chunks = await asyncio.to_thread(self.transcribe, wav, lang)
                 if txt:
+                    norm = ["".join(ch for ch in c if ch.isalnum()) for c in chunks]
+                    norm = [x for x in norm if x]
+                    repeated = len(norm) >= 3 and len(set(norm)) == 1 and len(norm[0]) <= 4
+                    cps = len(txt) / dur
+                    if repeated or (len(txt) <= 2 and dur > 8):
+                        logger.warning(f"ASR 幻觉判定：文本过短或重复（{len(txt)} 字 / {dur:.0f}s，chunks={len(norm)}），丢弃")
+                        return "", "none"
+                    if cps > 9 or cps < 0.15:
+                        logger.warning(f"ASR 可疑：语速 {cps:.2f} 字/秒（时长 {dur:.0f}s），保留但标记")
                     txt = await self.clean_transcript(txt)
                     return txt, "asr"
             except Exception as exc:
                 logger.warning(f"转写失败：{exc}")
             finally:
                 wav.unlink(missing_ok=True)
-        return "", ""
+        return "", "none"
 
     @staticmethod
     def _parse_vision(text: str) -> tuple[str, str, list[str], str]:
@@ -790,6 +865,9 @@ class VideoStoryboard(Star):
 
     async def clean_transcript(self, text: str) -> str:
         """给 ASR 原文补标点、纠同音错字；失败就原样返回。"""
+        if not isinstance(text, str):
+            logger.warning(f"clean_transcript 收到 {type(text)}: {text!r}"[:300])
+            text = str(text)
         try:
             provider = self.context.get_using_provider()
             if provider is None:
@@ -876,7 +954,7 @@ class VideoStoryboard(Star):
             wav = zdir / "z.wav"
             if await self.extract_audio(path, seg_start + a, dur, wav):
                 try:
-                    transcript = await asyncio.to_thread(self.transcribe, wav, lang)
+                    transcript, _chunks = await asyncio.to_thread(self.transcribe, wav, lang)
                     if transcript:
                         transcript = await self.clean_transcript(transcript)
                 except Exception as exc:
@@ -986,6 +1064,10 @@ class VideoStoryboard(Star):
                 total = min(total, int(self._c("max_segments_per_run")))
             per = int(self._c("frames_per_segment", 9) or 9)
             per = max(2, min(per, 36))
+            gap = int(self._c("max_gap_seconds", 8) or 8)
+            gap = max(3, min(60, gap))
+            if seg_len / per > gap:
+                per = min(36, max(per, int(math.ceil(seg_len / gap))))
             asr_on = bool(self._c("asr_enable", True))
             lang = str(self._c("asr_language", "auto") or "auto")
             push = bool(self._c("push_progress", True))
@@ -1010,7 +1092,7 @@ class VideoStoryboard(Star):
 
             self._bg_job(
                 job,
-                f"开始看了：《{path.name}》{self._ts(info['duration'])}，{total} 段"
+                f"开始看了：《{path.name}》{self._ts(info['duration'])}，{total} 段（抽查间隔约 {seg_len / per:.0f} 秒，即最大盲区）"
                 + (f"（从第 {start_idx + 1} 段接着看）" if start_idx else ""),
             )
             for i in range(start_idx, total):
@@ -1649,6 +1731,59 @@ class VideoStoryboard(Star):
             self._log("memory_ok", memory_id)
         except Exception as exc:
             self._log("memory_fail", f"{type(exc).__name__}: {exc}")
+
+    @filter.llm_tool(name="watch_video")
+    async def tool_watch_video(self, event: AstrMessageEvent, filename: str, segments: int = 0):
+        """让机器人自己看一个本地视频：分段抽帧、读字幕/听声音，然后逐段讲给主人听。
+
+        Args:
+            filename(string): 视频文件名，放在视频文件夹里的那个名字，也可以给完整路径
+            segments(number): 最多看几段，0 表示整部都看
+        """
+        try:
+            path = self._resolve(filename)
+        except Exception as exc:
+            return f"没找到视频 {filename}：{exc}"
+        if not path or not path.is_file():
+            return f"没找到视频 {filename}，让他先把文件放进视频文件夹。"
+        return await self.start_job(event, path, int(segments or 0))
+
+    @filter.llm_tool(name="video_chapters")
+    async def tool_video_chapters(self, event: AstrMessageEvent):
+        """列出一部已经看过的视频的章节（每段的时间范围和小标题）。
+
+        不带参数时用最近看过的那部。
+        """
+        log = self._latest_log()
+        if not log:
+            return "还没有看完过的视频，先让我看一部吧。"
+        segs = log.get("segments") or []
+        lines = [f"《{log.get('file') or '视频'}》"]
+        for i, s in enumerate(segs):
+            lines.append(f"{i + 1}. {s.get('start_str', '')}-{s.get('end_str', '')} {s.get('title') or ''}")
+        return "\n".join(lines)
+
+    @filter.llm_tool(name="video_ask")
+    async def tool_video_ask(self, event: AstrMessageEvent, question: str):
+        """就一部已经看过的视频回答问题（比如“刚才那集讲了什么”“那个反转在第几分钟”）。
+
+        Args:
+            question(string): 想问关于这部视频的问题
+        """
+        log = self._latest_log()
+        if not log:
+            return "还没有看完过的视频，先让我看一部吧。"
+        segs = log.get("segments") or []
+        picks = self._retrieve(segs, question, limit=3)
+        if not picks:
+            return "这部片子里我没找到相关的内容。"
+        parts = []
+        for s in picks:
+            parts.append(
+                f"[{s.get('start_str', '')}-{s.get('end_str', '')}] {s.get('title') or ''}："
+                f"{s.get('summary') or ''}\n台词节选：{(s.get('transcript') or '')[:200]}"
+            )
+        return "\n\n".join(parts)
 
     async def terminate(self):
         if self.job:

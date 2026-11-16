@@ -42,7 +42,7 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>分段看视频 · 参数</h1>
+  <h1>分段看视频 · 参数 <small style="opacity:.5;font-size:12px">v4</small></h1>
   <div class="sub">改完点保存即可，不用重启；正在跑的这次会用旧参数收尾，下一段起生效。</div>
 
   <div class="card">
@@ -51,6 +51,8 @@
       <input type="number" id="segment_seconds" min="30" max="3600" step="10" /></div>
     <div class="row"><div class="label"><b>每段格数</b><span>9 格 3×3、16 格 4×4、25 格 5×5、36 格 6×6（上限 36）</span></div>
       <input type="number" id="frames_per_segment" min="2" max="36" step="1" /></div>
+    <div class="row"><div class="label"><b>最大盲区（秒）</b><span>每段窗口 ÷ 格数超过它自动补格；默认 8，越小越密</span></div>
+      <input type="number" id="max_gap_seconds" min="3" max="60" step="1" /></div>
     <div class="row"><div class="label"><b>切镜灵敏度</b><span>0.2 更碎，0.5 更粗；默认 0.3</span></div>
       <input type="number" id="scene_threshold" min="0.05" max="0.9" step="0.05" /></div>
     <div class="row"><div class="label"><b>快剪双联帧</b><span>平均镜头 &lt; 2 秒时，每格用前后两帧左右拼图</span></div>
@@ -133,7 +135,7 @@
 </div>
 
 <script>
-const NUMS = ["segment_seconds","frames_per_segment","scene_threshold","zoom_frames","ocr_fps","ocr_band","max_segments_per_run"];
+const NUMS = ["segment_seconds","frames_per_segment","max_gap_seconds","scene_threshold","zoom_frames","ocr_fps","ocr_band","max_segments_per_run"];
 const SWITCHES = ["double_frame","auto_zoom","zoom_enable","subtitle_enable","ocr_enable","asr_enable","memory_write"];
 const SELECTS = ["asr_language","memory_write_mode"];
 let state = {};
@@ -143,15 +145,26 @@ function unwrap(r) {
   return r;
 }
 
+const API_BASE = "/api/plug/astrbot_plugin_video_storyboard/";
+
 async function jget(endpoint, params) {
-  const view = window.AstrBotPluginView;
-  if (view && typeof view.apiGet === "function") {
-    return unwrap(await view.apiGet(endpoint, params || {}));
+  const qs = (params && Object.keys(params).length) ? "?" + new URLSearchParams(params).toString() : "";
+  const url = API_BASE + endpoint + qs;
+  const view0 = window.AstrBotPluginView;
+  if (view0 && typeof view0.ready === "function") {
+    try {
+      await Promise.race([view0.ready(), new Promise(r => setTimeout(r, 1200))]);
+    } catch (e) { /* 等待桥就绪失败则继续 */ }
   }
-  const url = (params && Object.keys(params).length)
-    ? endpoint + "?" + new URLSearchParams(params).toString()
-    : endpoint;
+  try {
+    const view = window.AstrBotPluginView;
+    if (view && typeof view.apiGet === "function") {
+      const r = await view.apiGet(endpoint, params || {});
+      if (r) return unwrap(r);
+    }
+  } catch (e) { /* 桥不可用时走原生 fetch */ }
   const r = await fetch(url, { credentials: "include" });
+  if (!r.ok) throw new Error("HTTP " + r.status + " " + url);
   return await r.json();
 }
 

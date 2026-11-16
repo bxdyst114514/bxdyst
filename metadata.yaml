@@ -12,7 +12,7 @@ desc: |
   - 视频可以放进指定文件夹用 `/kv 文件名` 打开，也可以直接在 QQ 里发给机器人；
   - 可把每段/整片分析写入“我会牢牢记住你”的长期记忆；
   - 参数可在插件页面的「参数设置」里热改，下一段生效。
-version: 0.5.0
+version: 0.5.2
 author: xiaoman
 repo: https://github.com/bxdyst114514/bxdyst
 astrbot_version: ">=4.22.0"
