@@ -58,6 +58,12 @@
     "default": "auto",
     "hint": "auto / zh / en / ja / ko / yue"
   },
+  "push_mode": {
+    "type": "string",
+    "description": "推送方式：off 不推送 / summary 只发整体印象 / segment 逐段推送（含特写）",
+    "default": "segment",
+    "options": ["off", "summary", "segment"]
+  },
   "push_progress": {
     "description": "逐段播报",
     "type": "bool",

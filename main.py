@@ -107,6 +107,7 @@ class VideoStoryboard(Star):
         "asr_enable": bool,
         "asr_language": str,
         "push_progress": bool,
+        "push_mode": str,
         "push_segment_detail": bool,
         "memory_write": bool,
         "memory_write_mode": str,
@@ -175,40 +176,61 @@ class VideoStoryboard(Star):
             payload = {}
         return self._apply_page_changes(payload)
 
+    PAGE_RANGES = {
+        "segment_seconds": (15, 3600),
+        "frames_per_segment": (2, 36),
+        "max_gap_seconds": (3, 60),
+        "zoom_frames": (2, 36),
+        "scene_threshold": (0.05, 1.0),
+        "ocr_fps": (0.05, 5.0),
+        "ocr_band": (0.05, 0.6),
+        "max_segments_per_run": (0, 9999),
+    }
+
     def _apply_page_changes(self, payload: dict) -> dict:
         if not isinstance(payload, dict):
-            return {"status": "error", "message": "请求体格式不对", "data": {}}
+            return {"ok": False, "message": "请求体格式不对"}
         changed = {}
+        skipped = []
         for key, typ in self.PAGE_KEYS.items():
             if key not in payload:
                 continue
             raw = payload.get(key)
+            if raw is None or (isinstance(raw, str) and not raw.strip()):
+                skipped.append(key)
+                continue
             try:
                 if typ is bool:
                     val = raw if isinstance(raw, bool) else str(raw).strip().lower() in ("1", "true", "yes", "on")
                 elif typ is int:
-                    val = int(raw)
+                    val = int(float(raw))
                 elif typ is float:
                     val = float(raw)
                 else:
                     val = str(raw).strip()
             except Exception:
-                return {"status": "error", "message": f"参数 {key} 的值不合法", "data": {}}
+                return {"ok": False, "message": f"参数 {key} 的值不合法"}
+            rng = self.PAGE_RANGES.get(key)
+            if rng and isinstance(val, (int, float)) and not isinstance(val, bool):
+                lo, hi = rng
+                val = max(lo, min(hi, val))
             changed[key] = val
+        if "push_mode" in changed:
+            pm = str(changed["push_mode"]).strip().lower()
+            if pm in ("off", "summary", "segment"):
+                changed["push_progress"] = pm != "off"
+                changed["push_segment_detail"] = pm == "segment"
         if not changed:
-            return {"status": "error", "message": "没有可保存的参数", "data": {}}
+            return {"ok": False, "message": "没有可保存的参数（可能页面还没读到配置）"}
         try:
             self.config.update(changed)
             save = getattr(self.config, "save_config", None)
             if callable(save):
                 save()
         except Exception as exc:
-            return {"status": "error", "message": f"保存失败: {exc}", "data": {}}
-        self._ffmpeg = None
-        self._ffprobe = None
-        logger.info(f"[video-storyboard] 扩展页面保存配置: {changed}")
-        return {"status": "ok", "message": "已保存，下一段起生效", "data": self._page_payload()}
-
+            return {"ok": False, "message": f"保存失败: {exc}"}
+        tail = f"（已跳过空值: {', '.join(skipped)}）" if skipped else ""
+        return {"ok": True, "message": "已保存，下一段起生效" + tail, "config": self._page_payload()}
 
     def _watch_dir(self) -> Path:
         configured = str(self._c("watch_dir", "") or "").strip().strip('"')
@@ -1047,7 +1069,13 @@ class VideoStoryboard(Star):
             self.job["start_index"] = len(done)
         task = asyncio.create_task(self._worker(limit_segments))
         self.job["task"] = task
-        return f"开始看《{path.name}》；先把时长和镜头扫一遍，然后每看完一段我说一句。"
+        name = path.name
+        openers = [
+            f"《{name}》是吧，我这就去看——先摸一遍镜头，看完一段跟你说一句。",
+            f"好，《{name}》交给我。先扫一遍画面节奏，再一段一段跟你唠。",
+            f"《{name}》收到～我先看一眼它多长、镜头怎么切，然后边看边跟你说。",
+        ]
+        return openers[sum(map(ord, name)) % len(openers)]
 
     async def _worker(self, limit_segments: int):
         job = self.job
@@ -1071,6 +1099,11 @@ class VideoStoryboard(Star):
             asr_on = bool(self._c("asr_enable", True))
             lang = str(self._c("asr_language", "auto") or "auto")
             push = bool(self._c("push_progress", True))
+            mode = str(self._c("push_mode", "") or "").strip().lower()
+            if mode not in ("off", "summary", "segment"):
+                mode = "segment" if push else ("summary" if bool(self._c("push_segment_detail", True)) else "off")
+            push_seg = mode == "segment"
+            push_final = mode != "off"
             zoom_on = bool(self._c("zoom_enable", True))
             auto_zoom = bool(self._c("auto_zoom", True))
             done = job["segments"]
@@ -1084,17 +1117,14 @@ class VideoStoryboard(Star):
                 self._bg_job(job, "分段时长改过了，之前那几段对不上，我重新从头看。")
             start_idx = len(done)
             if start_idx >= total:
-                text = "这个视频之前已经看完了。"
+                if not push_final:
+                    return
+                text = "这个我先前已经看过啦，直接跟你说说印象？"
                 if done:
-                    text += "\n\n整体印象：" + (await self.final_summary(done))
+                    text += "\n\n" + (await self.final_summary(done))
                 self._bg_job(job, text)
                 return
 
-            self._bg_job(
-                job,
-                f"开始看了：《{path.name}》{self._ts(info['duration'])}，{total} 段（抽查间隔约 {seg_len / per:.0f} 秒，即最大盲区）"
-                + (f"（从第 {start_idx + 1} 段接着看）" if start_idx else ""),
-            )
             for i in range(start_idx, total):
                 if job["stop"]:
                     self._bg_job(job, "好，先看到这。")
@@ -1157,7 +1187,7 @@ class VideoStoryboard(Star):
                                ensure_ascii=False, indent=1),
                     "utf-8",
                 )
-                if push and bool(self._c("push_segment_detail", True)):
+                if push_seg:
                     text_i = f"第 {i + 1}/{total} 段（{self._ts(start)}-{self._ts(end)}）：{summary}"
                     parts = [Plain(text_i)]
                     if sheet.exists():
@@ -1197,7 +1227,7 @@ class VideoStoryboard(Star):
                         {"video_title": path.stem, "segment": i + 1,
                          "start": start, "end": end, "keywords": keywords},
                     )
-                if zoom_on and auto_zoom and item.get("cells"):
+                if push_seg and zoom_on and auto_zoom and item.get("cells"):
                     try:
                         z = await self._auto_zoom(job, path, seg_dir, start, plan, cuts,
                                                  i, total, lang, asr_on)
@@ -1250,7 +1280,9 @@ class VideoStoryboard(Star):
                 )
             except Exception:
                 pass
-            text = f"看完了，共 {total} 段。"
+            if not push_final:
+                return
+            text = f"看完啦，一共 {total} 段。"
             if overall:
                 text += "\n\n" + overall
             self._bg_job(job, text)
@@ -1683,6 +1715,7 @@ class VideoStoryboard(Star):
     @staticmethod
     def _vid(path) -> str:
         try:
+            path = Path(path)
             st = path.stat()
             return hashlib.sha1(f"{path.name}:{st.st_size}".encode("utf-8")).hexdigest()[:16]
         except Exception:

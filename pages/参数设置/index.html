@@ -171,22 +171,32 @@ async function jget(endpoint, params) {
 function render() {
   NUMS.forEach(k => { const el = document.getElementById(k); if (el) el.value = state[k] ?? ""; });
   SELECTS.forEach(k => { const el = document.getElementById(k); if (el) el.value = state[k] || ""; });
+  const wdEl = document.getElementById("watch_dir");
+  if (wdEl) wdEl.value = state.watch_dir || "";
   document.querySelectorAll(".sw").forEach(sw => {
     sw.classList.toggle("on", !!state[sw.dataset.key]);
   });
-  const mode = !state.push_progress ? "off" : (state.push_segment_detail ? "segment" : "summary");
+  const mode = state.push_mode || (!state.push_progress ? "off" : (state.push_segment_detail ? "segment" : "summary"));
   document.querySelectorAll("#push_mode .mode").forEach(m => m.classList.toggle("on", m.dataset.mode === mode));
 }
 
-async function getConfig() {
+async function getConfig(retries = 6) {
   const msg = document.getElementById("msg");
-  try {
-    const j = await jget("page/config");
-    state = (j && j.config) ? j.config : (j || {});
-  } catch (e) {
-    msg.textContent = "读取失败：" + e;
+  for (let i = 0; i < retries; i++) {
+    try {
+      const j = await jget("page/config");
+      const cfg = (j && j.config) ? j.config : j;
+      if (cfg && typeof cfg === "object" && Object.keys(cfg).length) {
+        state = cfg;
+        msg.textContent = "";
+        render();
+        return true;
+      }
+    } catch (e) { /* 面板刚打开时请求常被中断，继续重试 */ }
+    await new Promise(r => setTimeout(r, 200 * (i + 1)));
   }
-  render();
+  msg.textContent = "读取失败：页面还没连上，点「重新读取」再试一次";
+  return false;
 }
 
 document.querySelectorAll(".sw").forEach(sw => {
@@ -200,6 +210,7 @@ document.querySelectorAll(".sw").forEach(sw => {
 document.querySelectorAll("#push_mode .mode").forEach(m => {
   m.addEventListener("click", () => {
     const mode = m.dataset.mode;
+    state.push_mode = mode;
     state.push_progress = mode !== "off";
     state.push_segment_detail = mode === "segment";
     document.querySelectorAll("#push_mode .mode").forEach(x => x.classList.toggle("on", x === m));
@@ -220,13 +231,18 @@ function collect() {
     if (el) changes[k] = el.value;
   });
   SWITCHES.forEach(k => { changes[k] = !!state[k]; });
+  changes.push_mode = state.push_mode || "segment";
   const wd = document.getElementById("watch_dir");
-  if (wd) changes.watch_dir = wd.value.trim();
+  if (wd && wd.value.trim()) changes.watch_dir = wd.value.trim();
   return changes;
 }
 
 async function save() {
   const msg = document.getElementById("msg");
+  if (!state || !Object.keys(state).length) {
+    msg.textContent = "还没读到配置，先点「重新读取」";
+    return;
+  }
   msg.textContent = "保存中…";
   try {
     const changes = collect();
@@ -248,8 +264,12 @@ async function save() {
 }
 
 document.getElementById("save").addEventListener("click", save);
-document.getElementById("reload").addEventListener("click", getConfig);
+document.getElementById("reload").addEventListener("click", () => getConfig());
 getConfig();
+setTimeout(() => { if (!Object.keys(state).length) getConfig(); }, 1800);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && !Object.keys(state).length) getConfig();
+});
 </script>
 </body>
 </html>
